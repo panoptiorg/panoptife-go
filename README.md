@@ -1,3 +1,5 @@
+<img src=".github/logo.svg" alt="panoptife-go logo" width="126" height="126">
+
 # panoptife-go
 
 **The Go frontend for [Panopticode][core]: turns a Go module into code graph facts.**

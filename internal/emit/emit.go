@@ -48,7 +48,8 @@ type Options struct {
 	// the corpus is partial and every number off it is a floor.
 	AllowMissingScope bool
 	// Dispatch selects virtual-dispatch resolution: "vta" (default), "cha", or
-	// "off" (no call graph; every dynamic site stays opaque).
+	// "off" (no call graph: function-value calls are opaque; interface calls
+	// get no targets but are not marked opaque).
 	Dispatch string
 	// CgStoreDir enables the call-graph snapshot store (R4 Ph1): a re-extract
 	// at an unchanged commit replays persisted dispatch instead of rebuilding
@@ -295,7 +296,7 @@ func Run(o Options) error {
 	// silently missing boundary, so it is reported, never swallowed.
 	if rc := fo.RemoteClients; rc != nil {
 		if rc.Linked > 0 {
-			fmt.Fprintf(os.Stderr, "remote-clients: %d call site(s) on hand-rolled client interfaces linked to pb <Svc>Client by method-set identity\n", rc.Linked)
+			fmt.Fprintf(os.Stderr, "remote-clients: %d call site(s) linked to a generated <Svc>Client by method-set identity\n", rc.Linked)
 		}
 		if n := len(rc.Unclassified); n > 0 {
 			sites := 0
@@ -570,7 +571,7 @@ type siteCensus struct {
 	sites      int // total CallSite entries emitted
 	opaque     int // CallSite.Opaque == true
 	capped     int // opaque because TargetsAt's fan-out cap tripped
-	unresolved int // opaque dynamic dispatch that resolved to zero targets, uncapped
+	unresolved int // interface, func-value or builtin call with zero targets, uncapped; opaque unless an interface call
 	dangling   int // resolved target whose iid was never emitted (scope gap)
 }
 

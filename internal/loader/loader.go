@@ -1,6 +1,7 @@
-// Package loader loads Go packages with full type info and builds SSA + a VTA
-// call graph. Error-tolerant: packages that fail to type-check are skipped, not
-// fatal — needed to load real, partially-resolvable monorepo services (doc 02).
+// Package loader loads Go packages with full type info and builds SSA;
+// BuildCallGraph builds the call graph separately (VTA, CHA or none).
+// Error-tolerant: packages that fail to type-check are skipped, not fatal —
+// needed to load real, partially-resolvable monorepo services.
 package loader
 
 import (
@@ -183,8 +184,8 @@ func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, 
 // BuildCallGraph resolves interface/dynamic dispatch over the built SSA. VTA
 // (default) is precise but whole-program and superlinear — the dominant
 // extraction cost on large repos; CHA is near-linear but over-approximates
-// (doc 21 §4.3b); "off" skips the build entirely — every dynamic site stays
-// opaque, the pre-dispatch-wiring behavior.
+// (doc 21 §4.3b); "off" skips the build entirely — function-value calls are
+// then opaque, interface calls get no targets but are not marked opaque.
 func BuildCallGraph(prog *ssa.Program, dispatch string) (*callgraph.Graph, time.Duration) {
 	t0 := time.Now()
 	var cg *callgraph.Graph

@@ -13,14 +13,16 @@ repositories at contract boundaries.
 ## 1. Loading
 
 `internal/loader` calls `packages.Load` on the `--scope` patterns from the
-module directory, with full syntax and type information and `Tests: false`,
-so `_test.go` files are never loaded. Type errors in individual packages are
+module directory, with full syntax and type information for the matched
+packages and all their dependencies (type-checked from source), and
+`Tests: false`, so `_test.go` files are never loaded. Type errors in individual packages are
 tolerated. The run fails instead of emitting a near-empty CGF when:
 
 - any package reports `requires newer Go version` (the toolchain `pc-fe` was
   built with is older than the module's `go` directive; rebuild it with a
   newer one);
-- nothing was built, or more than half the root packages failed to load;
+- nothing was built, or more than half the returned root packages have load
+  or type errors;
 - a scope pattern that is a literal import path produced no package
   (`--allow-missing-scope` overrides this). Wildcard and relative patterns
   such as `./...` or `./internal/x` are not checked.
@@ -68,9 +70,12 @@ site with `n` targets gets `1/n`. A site with more than 10 targets
 (`DefaultFanoutCap`) is marked `opaque` with no targets: the core then treats
 the call as an unknown library call.
 
-With `--dispatch off`, calls through function values are marked `opaque`;
-interface method calls get no targets but are not marked `opaque`. Both
-kinds are counted as `unresolved` in the census line below.
+A call through a function value with no targets is marked `opaque`; an
+interface method call with no targets is not. Either gets one callee id
+hashed from its `callee_fqn`, which matches no emitted function. With
+`--dispatch off` no interface or function-value call has targets. Both
+kinds, and builtin calls, are counted as `unresolved` in the census line
+below.
 
 ### Call-graph cache (cgstore)
 
@@ -98,10 +103,10 @@ slots and ports:
 | vertex kind | meaning |
 |---|---|
 | `IN_PARAM`, `IN_RECEIVER` | the function's inputs |
-| `IN_GLOBAL` | a package-level variable read, or a heap-cell read |
+| `IN_GLOBAL` | a heap-cell read (`--heap-slots`) |
 | `OUT_RETURN` | a returned value |
-| `OUT_PARAM_BYREF`, `OUT_RECEIVER_BYREF` | a parameter or receiver written through a pointer (`--byref-out`) |
-| `OUT_FIELD` | a field write; with a `sym`, a heap-cell write |
+| `OUT_PARAM_BYREF`, `OUT_RECEIVER_BYREF` | a parameter or receiver written through a pointer, slice, map or channel (`--byref-out`) |
+| `OUT_FIELD` | a heap-cell write (`--heap-slots`) |
 | `CALL_ARG_PORT`, `CALL_RESULT_PORT` | the inputs and outputs of one call site |
 
 Intermediate SSA values are collapsed: an edge means "data can flow from this
@@ -114,7 +119,8 @@ vertex, so `req.Number` and `req.Name` are distinct; longer paths are
 truncated to their first two fields, which over-approximates. For generated
 protobuf structs a field is identified by its proto field number, otherwise
 by its index. Trivial generated getters (`req.GetNumber()`) in `--pb-paths`
-packages become field projections and their call sites disappear. Nullable
+packages that are in `--scope` (the getter's body must be built) become
+field projections and their call sites disappear. Nullable
 wrapper types are transparent to field paths: `database/sql` `Null*`,
 `guregu/null`, `volatiletech/null`, sqlboiler `types/null` and `wrapperspb`.
 
@@ -126,7 +132,9 @@ Call sites record kind (`STATIC`, `VIRTUAL`, `INVOKES_REMOTE`, `GO`,
 `DEFER`), argument and result counts, whether argument 0 is the receiver,
 `callee_fqn` for catalog matching, the resolved `callee_iids`, confidence,
 the `opaque` bit, and with `--error-results` a bitmask of `error`-typed
-results. `BUILTIN` exists in the schema but is not emitted.
+results. `BUILTIN` exists in the schema but is not emitted: a builtin call
+such as `len` is an `opaque` `STATIC` site whose `callee_fqn` is its
+signature.
 
 ### Containers
 
@@ -194,11 +202,13 @@ one of these holds, tried in order:
    stream type in a `--pb-paths` package (a stream data port);
 2. the receiver is a generated `<Svc>Client` interface in a `--pb-paths`
    package;
-3. the receiver is a hand-written interface that exactly one generated
-   `<Svc>Client` implements (`internal/flow/remoteclient.go`). A generated
-   package is recognised by `--pb-paths` or by every method taking
-   `...grpc.CallOption`. If more than one client matches, the call is left
-   as a normal virtual call and reported on a `remote-warn:` line.
+3. the receiver is any other interface that exactly one generated
+   `<Svc>Client` implements: a hand-written interface narrowing it, or the
+   generated interface itself in a package `--pb-paths` does not match
+   (`internal/flow/remoteclient.go`). A generated client is recognised by
+   `--pb-paths` or by every method taking `...grpc.CallOption`. If more than
+   one client matches, the call is left as a normal virtual call and
+   reported on a `remote-warn:` line.
 
 Otherwise the call goes through normal dispatch.
 
@@ -222,7 +232,8 @@ HTTP handlers are never emitted as endpoints.
   function name and signature. It survives body edits.
 - `bid` = SHA-256 over the canonical LocalFlow and the sorted callee iids.
   The canonical form drops spans, field names and callee ids from the flow,
-  so moving a line or renaming a field does not change it. Callees enter by
+  so moving a line or renaming a field does not change it (except a heap-cell
+  field under `--heap-slots`, whose `sym_name` is kept). Callees enter by
   `iid`, so a change inside a callee does not change its callers' `bid`.
 - `contract_iid` = the same hash over the contract name
   (`graphql:<Type>.<field>` for GraphQL).
@@ -246,8 +257,8 @@ Every run prints to stderr:
 - `pc-fe timing: load=... ssa-build=... dispatch[<mode>]=...` (`<mode>-cached`
   when replayed from cgstore);
 - `opaque: sites= opaque= capped= unresolved= dangling=`: total call sites,
-  opaque sites, sites over the fan-out cap, dynamic sites with no targets,
-  and resolved targets outside the emitted set.
+  opaque sites, sites over the fan-out cap, interface, function-value and
+  builtin calls with no targets, and resolved targets outside the emitted set.
 
 Printed when they apply:
 
@@ -257,7 +268,7 @@ Printed when they apply:
 | `emit-warn: ... Unimplemented<Svc>Server but 0 gRPC handlers` | the server type exists but its handlers are outside `--scope` |
 | `contracts-warn:` | the generated `<Svc>Server` interface was not found; handlers were matched by shape |
 | `graphql-warn:` | a GraphQL name was derived from the Go method name |
-| `remote-clients:` | calls linked to a generated client through a hand-written interface |
+| `remote-clients:` | calls linked to a generated client by rule 3 of [gRPC clients](#grpc-clients) |
 | `remote-warn:` | gRPC-shaped calls on interfaces that no generated client, or more than one, implements |
 | `generics-gap:` | generic instantiations and call edges that could not be emitted |
 | `cgstore:` | cache disabled, rebuilt after a failed replay, or failed to write |
@@ -269,8 +280,10 @@ supported generators and the current `--pb-paths`.
 
 - Only `protoc-gen-go-grpc` and gqlgen boundaries are recognised; other
   stacks produce no endpoints.
-- A call directly on a generated `<Svc>Client` whose package is not matched
-  by `--pb-paths` is not recognised as remote.
+- `Send`/`Recv` on a generated stream type whose package is not matched by
+  `--pb-paths` is not recognised as a stream port. Calls on the generated
+  `<Svc>Client` itself are still caught by rule 3 of
+  [gRPC clients](#grpc-clients).
 - Contract names depend on the Go package name of generated code.
 - Scope holes behind wildcard patterns are not detected; code outside the
   scope has no body.

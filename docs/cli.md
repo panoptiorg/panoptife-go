@@ -92,7 +92,7 @@ every one of these changes the CGF bytes and is part of the cgstore key.
 | `--heap-slots-scope` | `chan` | with `--heap-slots`: `chan` (channel-typed fields only) or `all` |
 | `--heap-iface-narrow` | `false` | with `--heap-slots`: tag interface-typed cells with the concrete type so the core can drop impossible pairings |
 | `--heap-iface-drop` | `false` | with `--heap-slots`: never create cells for interface-typed fields. Experimental; loses real flows |
-| `--byref-out` | `false` | out-slots for parameters and receivers written through a pointer, plus the caller-side back-edge |
+| `--byref-out` | `false` | out-slots for every pointer, slice and map parameter and receiver (and channel, with `--container-writes`), plus the caller-side back-edge |
 | `--error-results` | `false` | record which call results are `error`-typed (`CallSite.error_results`), for the core's `--no-error-leaf` |
 | `--error-results-strict` | `false` | with `--error-results`: also drop the whole-tuple alias for multi-result calls |
 

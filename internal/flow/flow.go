@@ -63,11 +63,12 @@ type Result struct {
 	// than enumerated. Census-only (pc-fe's "opaque:" stderr line); not part
 	// of the CGF.
 	CappedSites int
-	// UnresolvedDynamicSites is the count of dynamic-dispatch call sites where
-	// TargetsAt resolved zero targets WITHOUT being capped — the resolver
+	// UnresolvedDynamicSites is the count of call sites with no static callee
+	// where TargetsAt resolved zero targets WITHOUT being capped — the resolver
 	// found no callee at all (e.g. dispatch=off, or a genuinely unindexed
-	// site). Distinct from CappedSites: same cs.Opaque=true outcome, different
-	// cause. Census-only.
+	// site). Builtins such as `len` take this path too. Distinct from
+	// CappedSites: a function-value or builtin call gets cs.Opaque=true, an
+	// interface call does not. Census-only.
 	UnresolvedDynamicSites int
 }
 
@@ -162,8 +163,9 @@ type Opts struct {
 	// back to "has no SSA body", which is what out-of-scope means for
 	// non-generic callees. Not part of any cache key (a policy, not a setting).
 	Emittable func(*ssa.Function) bool
-	// RemoteClients links hand-rolled client interfaces to pb <Svc>Client
-	// types by method-set identity (FN-01; see remoteclient.go). nil = the
+	// RemoteClients links interface calls (hand-rolled client interfaces, or a
+	// generated <Svc>Client outside --pb-paths) to a generated <Svc>Client by
+	// method-set identity (FN-01; see remoteclient.go). nil = the
 	// name-convention detector only. Not part of any cache key: extract_key
 	// hashes the binary, so a detector change invalidates by construction.
 	RemoteClients *RemoteClientIndex
@@ -232,7 +234,8 @@ type edge struct {
 const maxFieldPath = 2
 
 // Build computes the LocalFlow for fn. fn must have a body. res resolves
-// virtual dispatch per call site; nil res leaves all dynamic sites opaque.
+// virtual dispatch per call site; nil res resolves nothing (function-value
+// calls opaque, interface calls with no targets but not opaque).
 // Each Opts field defaults (false) to the emission that preceded it, byte for
 // byte — see Opts.
 func Build(fn *ssa.Function, res Dispatcher, o Opts) *Result {
@@ -1434,7 +1437,8 @@ func numResults(cc *ssa.CallCommon) int {
 }
 
 // remoteContract recognizes a call on a generated gRPC <Svc>Client interface
-// and returns the proto-style full name "pkg.Service/Method". Both the client
+// and returns the contract name "<pkg>.<Service>/<Method>", where <pkg> is the
+// Go package name of the generated code, not the .proto package. Both the client
 // repo and the server repo derive the same string, so ContractIID links them.
 func remoteContract(cc *ssa.CallCommon, pbp pkgclass.PbPaths) (string, bool) {
 	if cc.Method == nil {
