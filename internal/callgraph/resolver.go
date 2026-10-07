@@ -1,6 +1,5 @@
 // Package callgraph resolves virtual-dispatch targets at individual call sites
-// from a whole-program call graph (VTA or CHA) — Phase A of the incremental
-// call-graph design (docs/incremental_callgraph_spec.md). Sites whose fan-out
+// from a whole-program call graph (VTA or CHA). Sites whose fan-out
 // exceeds the cap are reported opaque so emit falls back to the default-leaf
 // iid, keeping wide interfaces exactly as cheap (and as over-approximate) as
 // before dispatch wiring.

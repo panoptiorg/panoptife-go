@@ -33,11 +33,12 @@ func PackagePath(fn *ssa.Function) string {
 	return ""
 }
 
-// ContractIID is the cross-repo join key for a gRPC method, derived from the
-// proto-style full name "pkg.Service/Method". Both the defining repo (server)
-// and the calling repo (client) compute the SAME value from Go type-name
-// conventions, so invokes_remote links to the handler summary with no fuzzy
-// matching (doc 02 §4, doc 04 §4).
+// ContractIID is the cross-repo join key for a contract: a gRPC method named
+// "<pkg>.<Service>/<Method>" (<pkg> is the Go package name of the generated
+// code, not the .proto package), or a GraphQL field named
+// "graphql:<Type>.<field>"; both use the "grpc" tag. Both the defining repo
+// (server) and the calling repo (client) compute the SAME value from the same
+// name, so invokes_remote links to the handler summary with no fuzzy matching.
 func ContractIID(fullName string) []byte {
 	return IIDFromParts("", "", fullName, "grpc")
 }

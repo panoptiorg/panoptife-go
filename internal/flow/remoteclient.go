@@ -96,7 +96,8 @@ func BuildRemoteClientIndex(prog *ssa.Program, pbp pkgclass.PbPaths) *RemoteClie
 }
 
 // Resolve classifies an interface call whose receiver remoteContract rejected.
-// Returns the proto-style contract name when exactly one pb client satisfies
+// Returns the contract name ("<Go package name>.<Service>/<Method>", as
+// remoteContract builds it) when exactly one pb client satisfies
 // the receiver's interface.
 func (idx *RemoteClientIndex) Resolve(cc *ssa.CallCommon) (string, bool) {
 	if idx == nil || cc.Method == nil {
