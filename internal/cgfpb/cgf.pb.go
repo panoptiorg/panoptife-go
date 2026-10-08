@@ -4,9 +4,10 @@
 // 	protoc        v6.32.1
 // source: cgf.proto
 
-// CGF — Code Graph Facts. The language-neutral contract between the Go frontend
-// (extraction) and the Rust core (IFDS taint). One CgfPackage is emitted per Go
-// package. See panopticode/docs/02,03. Boolean-taint MVP; additive-only schema.
+// CGF — Code Graph Facts. The language-neutral contract between the frontends
+// (extraction, Go and TypeScript) and the Rust core (taint summaries). One
+// CgfPackage is emitted per Go package or TypeScript directory. See
+// docs/cgf.md. Boolean-taint MVP; additive-only schema.
 
 package cgfpb
 
@@ -129,19 +130,20 @@ func (Generator) EnumDescriptor() ([]byte, []int) {
 type VertexKind int32
 
 const (
-	VertexKind_IN_PARAM         VertexKind = 0 // param_i        (index = param index; field_path k<=1)
-	VertexKind_IN_RECEIVER      VertexKind = 1 // receiver
-	VertexKind_IN_GLOBAL        VertexKind = 2 // global_i       (sym = global symbol iid)
-	VertexKind_OUT_RETURN       VertexKind = 3 // return_j       (index = return index)
-	VertexKind_OUT_PARAM_BYREF  VertexKind = 4 // param_i mutated by-ref
-	VertexKind_OUT_FIELD        VertexKind = 5 // field_j of receiver/return aggregate
+	VertexKind_IN_PARAM        VertexKind = 0 // param_i        (index = param index; field_path k<=2)
+	VertexKind_IN_RECEIVER     VertexKind = 1 // receiver
+	VertexKind_IN_GLOBAL       VertexKind = 2 // heap-cell read (sym); Go, --heap-slots only
+	VertexKind_OUT_RETURN      VertexKind = 3 // return_j       (index = return index)
+	VertexKind_OUT_PARAM_BYREF VertexKind = 4 // param_i mutated by-ref
+	VertexKind_OUT_FIELD       VertexKind = 5 // field_j of receiver/return aggregate; Go emits it
+	// only for heap-cell writes (sym set, --heap-slots)
 	VertexKind_CALL_ARG_PORT    VertexKind = 6 // callsite arg   (callsite_id, index = arg index)
 	VertexKind_CALL_RESULT_PORT VertexKind = 7 // callsite result(callsite_id, index = result index)
-	// W1a. The receiver mutated by-ref. It cannot be OUT_PARAM_BYREF: that index
-	// is IN_PARAM-relative and the caller maps it to arg port index+1 whenever
-	// arg0_is_receiver (the N3 fix, ifds.rs), so port 0 is unaddressable — a
-	// receiver write emitted as OUT_PARAM_BYREF(0) would land on the first real
-	// argument. Mirrors the IN direction, where port 0 is Slot::Receiver.
+	// The receiver mutated by-ref. It cannot be OUT_PARAM_BYREF: that index is
+	// IN_PARAM-relative and the caller maps it to arg port index+1 whenever
+	// arg0_is_receiver (ifds.rs), so port 0 is unaddressable — a receiver write
+	// emitted as OUT_PARAM_BYREF(0) would land on the first real argument.
+	// Mirrors the IN direction, where port 0 is Slot::Receiver.
 	VertexKind_OUT_RECEIVER_BYREF VertexKind = 8
 )
 
@@ -252,7 +254,7 @@ type CallSite_Kind int32
 const (
 	CallSite_STATIC         CallSite_Kind = 0
 	CallSite_VIRTUAL        CallSite_Kind = 1 // VTA fan-out => multiple callee_iids
-	CallSite_INVOKES_REMOTE CallSite_Kind = 2 // callee_iids = [GrpcMethod.iid]
+	CallSite_INVOKES_REMOTE CallSite_Kind = 2 // callee_iids = [GrpcMethod.iid or GraphqlField.iid]
 	CallSite_GO             CallSite_Kind = 3
 	CallSite_DEFER          CallSite_Kind = 4
 	CallSite_BUILTIN        CallSite_Kind = 5
@@ -363,6 +365,7 @@ const (
 	Endpoint_GRPC    Endpoint_Kind = 0
 	Endpoint_GRAPHQL Endpoint_Kind = 1
 	Endpoint_HTTP    Endpoint_Kind = 2
+	Endpoint_MESSAGE Endpoint_Kind = 3 // a message-queue consumer callback (e.g. a Kafka ConsumeClaim)
 )
 
 // Enum value maps for Endpoint_Kind.
@@ -371,11 +374,13 @@ var (
 		0: "GRPC",
 		1: "GRAPHQL",
 		2: "HTTP",
+		3: "MESSAGE",
 	}
 	Endpoint_Kind_value = map[string]int32{
 		"GRPC":    0,
 		"GRAPHQL": 1,
 		"HTTP":    2,
+		"MESSAGE": 3,
 	}
 )
 
@@ -403,7 +408,7 @@ func (x Endpoint_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Endpoint_Kind.Descriptor instead.
 func (Endpoint_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_cgf_proto_rawDescGZIP(), []int{19, 0}
+	return file_cgf_proto_rawDescGZIP(), []int{21, 0}
 }
 
 // ---------------------------------------------------------------------------
@@ -412,16 +417,17 @@ func (Endpoint_Kind) EnumDescriptor() ([]byte, []int) {
 type CgfPackage struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Repo          string                 `protobuf:"bytes,1,opt,name=repo,proto3" json:"repo,omitempty"`                                         // canonical repo id, e.g. "gitlab.example.com/acme/ledger-svc"
-	CommitSha     string                 `protobuf:"bytes,2,opt,name=commit_sha,json=commitSha,proto3" json:"commit_sha,omitempty"`              // bitemporal stamp (doc 03 §4)
-	PackagePath   string                 `protobuf:"bytes,3,opt,name=package_path,json=packagePath,proto3" json:"package_path,omitempty"`        // Go import path
-	SchemaVersion int32                  `protobuf:"varint,4,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"` // additive-only (doc 03 §5)
-	Language      string                 `protobuf:"bytes,5,opt,name=language,proto3" json:"language,omitempty"`                                 // "go"
+	CommitSha     string                 `protobuf:"bytes,2,opt,name=commit_sha,json=commitSha,proto3" json:"commit_sha,omitempty"`              // bitemporal stamp
+	PackagePath   string                 `protobuf:"bytes,3,opt,name=package_path,json=packagePath,proto3" json:"package_path,omitempty"`        // Go import path; TypeScript directory
+	SchemaVersion int32                  `protobuf:"varint,4,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"` // additive-only
+	Language      string                 `protobuf:"bytes,5,opt,name=language,proto3" json:"language,omitempty"`                                 // "go" or "ts"
 	Functions     []*Function            `protobuf:"bytes,10,rep,name=functions,proto3" json:"functions,omitempty"`
 	Types         []*Type                `protobuf:"bytes,11,rep,name=types,proto3" json:"types,omitempty"`
 	ProtoMessages []*ProtoMessage        `protobuf:"bytes,12,rep,name=proto_messages,json=protoMessages,proto3" json:"proto_messages,omitempty"`
 	GrpcMethods   []*GrpcMethod          `protobuf:"bytes,13,rep,name=grpc_methods,json=grpcMethods,proto3" json:"grpc_methods,omitempty"`
 	GraphqlFields []*GraphqlField        `protobuf:"bytes,14,rep,name=graphql_fields,json=graphqlFields,proto3" json:"graphql_fields,omitempty"`
 	Endpoints     []*Endpoint            `protobuf:"bytes,15,rep,name=endpoints,proto3" json:"endpoints,omitempty"`
+	HttpRoutes    []*HttpRoute           `protobuf:"bytes,16,rep,name=http_routes,json=httpRoutes,proto3" json:"http_routes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -533,11 +539,23 @@ func (x *CgfPackage) GetEndpoints() []*Endpoint {
 	return nil
 }
 
+func (x *CgfPackage) GetHttpRoutes() []*HttpRoute {
+	if x != nil {
+		return x.HttpRoutes
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
-// Identity — two-level content hash (doc 03 §2). 32-byte SHA-256.
+// Identity — two-level content hash. 32-byte SHA-256 over length-prefixed parts.
 //
-//	iid = hash(repo, package_path, exported_symbol_path, normalized_signature)
-//	bid = hash(canonical LocalFlow) embedding callees' iids (NOT bids)
+//	iid: stable across body edits.
+//	  Go:         hash(repo, package_path, fqn, signature)
+//	  TypeScript: hash(repo, directory, "file:symbol", "ts")
+//	bid = hash(LocalFlow) embedding callees' iids (NOT bids). Go hashes a
+//	  deterministic protobuf encoding without spans or field names;
+//	  TypeScript hashes a JSON encoding, spans included.
+//	Contract ids are hash("", "", <name>, "grpc") in both frontends.
 //
 // ---------------------------------------------------------------------------
 type Ident struct {
@@ -663,14 +681,14 @@ type Function struct {
 	Origin    Origin                 `protobuf:"varint,4,opt,name=origin,proto3,enum=panopticode.cgf.Origin" json:"origin,omitempty"`
 	Generated bool                   `protobuf:"varint,5,opt,name=generated,proto3" json:"generated,omitempty"`
 	Generator Generator              `protobuf:"varint,6,opt,name=generator,proto3,enum=panopticode.cgf.Generator" json:"generator,omitempty"`
-	HasBody   bool                   `protobuf:"varint,7,opt,name=has_body,json=hasBody,proto3" json:"has_body,omitempty"` // false => signature-only; core uses default/known leaf
+	HasBody   bool                   `protobuf:"varint,7,opt,name=has_body,json=hasBody,proto3" json:"has_body,omitempty"` // always true; the core does not read it
 	Span      *Span                  `protobuf:"bytes,8,opt,name=span,proto3" json:"span,omitempty"`
 	Signature *Signature             `protobuf:"bytes,9,opt,name=signature,proto3" json:"signature,omitempty"`
 	Flow      *LocalFlow             `protobuf:"bytes,10,opt,name=flow,proto3" json:"flow,omitempty"`                      // value-flow sidecar (empty if !has_body)
 	BindsTo   [][]byte               `protobuf:"bytes,11,rep,name=binds_to,json=bindsTo,proto3" json:"binds_to,omitempty"` // Endpoint.iid this fn implements (handler<->endpoint)
 	// Param indices (flow InParam numbering: receiver excluded, first real param
 	// = 0) the core seeds as unconditional taint sources — the endpoint's
-	// untrusted args (doc 19). Affects summary_key, NOT bid (doc 20 §4).
+	// untrusted args. Affects summary_key, NOT bid.
 	SourceParams  []uint32 `protobuf:"varint,12,rep,packed,name=source_params,json=sourceParams,proto3" json:"source_params,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1165,9 +1183,8 @@ type FlowVertex struct {
 	Index      uint32                 `protobuf:"varint,3,opt,name=index,proto3" json:"index,omitempty"`
 	FieldPath  []uint32               `protobuf:"varint,4,rep,packed,name=field_path,json=fieldPath,proto3" json:"field_path,omitempty"` // bounded k=2 field sensitivity; empty = whole
 	CallsiteId uint32                 `protobuf:"varint,5,opt,name=callsite_id,json=callsiteId,proto3" json:"callsite_id,omitempty"`     // for CALL_ARG_PORT / CALL_RESULT_PORT
-	Sym        []byte                 `protobuf:"bytes,6,opt,name=sym,proto3" json:"sym,omitempty"`                                      // for IN_GLOBAL / OUT_FIELD: heap-cell identity.
-	// IN_GLOBAL: global symbol iid. Both kinds
-	// (W1F): H(type, field) — one abstract cell
+	Sym        []byte                 `protobuf:"bytes,6,opt,name=sym,proto3" json:"sym,omitempty"`                                      // for IN_GLOBAL / OUT_FIELD: heap-cell identity,
+	// H(type, field) — one abstract cell
 	// shared by every instance of that type.
 	// A set sym on OUT_FIELD makes the out-slot
 	// Global(sym), not Field(index).
@@ -1178,20 +1195,18 @@ type FlowVertex struct {
 	FieldNames []string `protobuf:"bytes,9,rep,name=field_names,json=fieldNames,proto3" json:"field_names,omitempty"`
 	// human name of the heap cell `sym` addresses, e.g. "epool.Pool.incoming".
 	// Reporting only — witness renders it as the route hop that crosses the cell,
-	// so a heap-mediated chain still opens against source (doc 24 N2).
+	// so a heap-mediated chain still opens against source.
 	SymName string `protobuf:"bytes,10,opt,name=sym_name,json=symName,proto3" json:"sym_name,omitempty"`
-	// A16 (doc 30 §6.1) — the type discriminant that narrows an interface-typed
-	// heap cell's writer->reader pairings. H("", <go type string>), empty = no
-	// constraint (which is every pre-A16 CGF, so the core's filter is inert on
-	// them). Emitted only under --heap-slots --heap-iface-narrow.
-	//
-	//	IN_GLOBAL:  the CONCRETE type the reader asserts the cell's value to
-	//	            (`event.EventSrc.(domain.SBPParam)`). The vertex sits on the
-	//	            *ssa.TypeAssert result, not on the load, so a raw use of the
-	//	            same field in the same function keeps its unconstrained slot.
-	//	OUT_FIELD:  the CONCRETE type this write stores into the interface field
-	//	            (the *ssa.MakeInterface operand).
-	//
+	// The type discriminant that narrows an interface-typed heap cell's
+	// writer->reader pairings. H("", <go type string>), empty = no constraint
+	// (the core's filter is then inert). Emitted only under --heap-slots
+	// --heap-iface-narrow.
+	//   IN_GLOBAL:  the CONCRETE type the reader asserts the cell's value to
+	//               (`event.EventSrc.(domain.SBPParam)`). The vertex sits on the
+	//               *ssa.TypeAssert result, not on the load, so a raw use of the
+	//               same field in the same function keeps its unconstrained slot.
+	//   OUT_FIELD:  the CONCRETE type this write stores into the interface field
+	//               (the *ssa.MakeInterface operand).
 	// A pairing is dropped when both are set and differ. Unknown on either side
 	// keeps the pairing — the sound direction.
 	IfaceType     []byte `protobuf:"bytes,11,opt,name=iface_type,json=ifaceType,proto3" json:"iface_type,omitempty"`
@@ -1370,27 +1385,28 @@ func (x *FlowEdge) GetViaAlias() bool {
 // Call sites — the wiring the core needs to compose summaries.
 // ---------------------------------------------------------------------------
 type CallSite struct {
-	state              protoimpl.MessageState `protogen:"open.v1"`
-	Id                 uint32                 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
-	Kind               CallSite_Kind          `protobuf:"varint,2,opt,name=kind,proto3,enum=panopticode.cgf.CallSite_Kind" json:"kind,omitempty"`
-	CalleeIids         [][]byte               `protobuf:"bytes,3,rep,name=callee_iids,json=calleeIids,proto3" json:"callee_iids,omitempty"`
-	Opaque             bool                   `protobuf:"varint,4,opt,name=opaque,proto3" json:"opaque,omitempty"`                       // unresolved => core applies default leaf
-	CalleeFqn          string                 `protobuf:"bytes,5,opt,name=callee_fqn,json=calleeFqn,proto3" json:"callee_fqn,omitempty"` // for catalog fqn/selector matching
-	Argc               uint32                 `protobuf:"varint,6,opt,name=argc,proto3" json:"argc,omitempty"`                           // arg-port vertices for 0..argc-1
-	Arg0IsReceiver     bool                   `protobuf:"varint,7,opt,name=arg0_is_receiver,json=arg0IsReceiver,proto3" json:"arg0_is_receiver,omitempty"`
-	Resultc            uint32                 `protobuf:"varint,8,opt,name=resultc,proto3" json:"resultc,omitempty"` // result-port vertices for 0..resultc-1
-	Span               *Span                  `protobuf:"bytes,9,opt,name=span,proto3" json:"span,omitempty"`
-	DispatchConfidence float32                `protobuf:"fixed32,10,opt,name=dispatch_confidence,json=dispatchConfidence,proto3" json:"dispatch_confidence,omitempty"` // 1.0 static; <1 VTA fan-out / unresolved
-	StreamOp           CallSite_StreamOp      `protobuf:"varint,11,opt,name=stream_op,json=streamOp,proto3,enum=panopticode.cgf.CallSite_StreamOp" json:"stream_op,omitempty"`
-	StreamClientSide   bool                   `protobuf:"varint,12,opt,name=stream_client_side,json=streamClientSide,proto3" json:"stream_client_side,omitempty"` // true: op on Svc_MClient; false: on Svc_MServer
-	// B1 (doc 31 §4) — bit j set = result j is `error`-typed
-	// (types.Implements, so concrete error types count too). The core's default
-	// leaf refuses to taint those ports unless the callee is a catalog-listed
-	// error wrapper, which is the largest FP class in the tree (doc 30 §6.2).
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Id         uint32                 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Kind       CallSite_Kind          `protobuf:"varint,2,opt,name=kind,proto3,enum=panopticode.cgf.CallSite_Kind" json:"kind,omitempty"`
+	CalleeIids [][]byte               `protobuf:"bytes,3,rep,name=callee_iids,json=calleeIids,proto3" json:"callee_iids,omitempty"`
+	Opaque     bool                   `protobuf:"varint,4,opt,name=opaque,proto3" json:"opaque,omitempty"` // unresolved; the core applies the default leaf to
+	// every call without a summary, opaque or not
+	CalleeFqn          string            `protobuf:"bytes,5,opt,name=callee_fqn,json=calleeFqn,proto3" json:"callee_fqn,omitempty"` // for catalog fqn/selector matching
+	Argc               uint32            `protobuf:"varint,6,opt,name=argc,proto3" json:"argc,omitempty"`                           // arg-port vertices for 0..argc-1
+	Arg0IsReceiver     bool              `protobuf:"varint,7,opt,name=arg0_is_receiver,json=arg0IsReceiver,proto3" json:"arg0_is_receiver,omitempty"`
+	Resultc            uint32            `protobuf:"varint,8,opt,name=resultc,proto3" json:"resultc,omitempty"` // result-port vertices for 0..resultc-1
+	Span               *Span             `protobuf:"bytes,9,opt,name=span,proto3" json:"span,omitempty"`
+	DispatchConfidence float32           `protobuf:"fixed32,10,opt,name=dispatch_confidence,json=dispatchConfidence,proto3" json:"dispatch_confidence,omitempty"` // 1/n for n dispatch targets (2..fan-out cap); else 1.0
+	StreamOp           CallSite_StreamOp `protobuf:"varint,11,opt,name=stream_op,json=streamOp,proto3,enum=panopticode.cgf.CallSite_StreamOp" json:"stream_op,omitempty"`
+	StreamClientSide   bool              `protobuf:"varint,12,opt,name=stream_client_side,json=streamClientSide,proto3" json:"stream_client_side,omitempty"` // true: op on Svc_MClient; false: on Svc_MServer
+	// Bit j set = result j is `error`-typed (types.Implements, so concrete
+	// error types count too). Under --no-error-leaf the core's default leaf
+	// refuses to taint those ports unless the callee is a catalog-listed error
+	// wrapper.
 	//
-	// Zero on every pre-B1 CGF, and zero means "unknown" — the core's filter is
-	// inert on them, the sound direction. Result-port vertices carry no `type`
-	// (flow.go:585 emits ""), which is why this is a fact and not a lookup; a
+	// Zero without --error-results, and zero means "unknown" — the core's filter
+	// is inert then, the sound direction. Result-port vertices carry no `type`
+	// (the Go frontend emits ""), which is why this is a fact and not a lookup; a
 	// bitmask rather than filling those types keeps it one varint per callsite
 	// and inert with respect to any future consumer of `type`.
 	// Emitted only under --error-results.
@@ -1398,7 +1414,12 @@ type CallSite struct {
 	// Name of arg port i (len == argc, "" = unnamed). Set by frontends whose
 	// call convention is by-name (GraphQL operations). Core: normalize.rs
 	// rewrites CALL_ARG_PORT indices into the contract's positional frame.
-	ArgNames      []string `protobuf:"bytes,14,rep,name=arg_names,json=argNames,proto3" json:"arg_names,omitempty"`
+	ArgNames []string `protobuf:"bytes,14,rep,name=arg_names,json=argNames,proto3" json:"arg_names,omitempty"`
+	// Set only on a synthetic HTTP client site (argc 1, resultc 0, every
+	// data-bearing argument of the real request call flowing into arg port 0).
+	// Unlinked, such a site is inert. The core links it to an HttpRoute by
+	// method + canonical path at load time and turns it into INVOKES_REMOTE.
+	HttpCall      *HttpCall `protobuf:"bytes,15,opt,name=http_call,json=httpCall,proto3" json:"http_call,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1531,8 +1552,70 @@ func (x *CallSite) GetArgNames() []string {
 	return nil
 }
 
+func (x *CallSite) GetHttpCall() *HttpCall {
+	if x != nil {
+		return x.HttpCall
+	}
+	return nil
+}
+
+type HttpCall struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Method string                 `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"` // upper-case; "" = unknown
+	// Canonical path template: params as "{}", catch-all tail as "{*}", no
+	// scheme/host/query. Leading "{}" segments = an unresolved base URL, so the
+	// path is only known as a suffix.
+	Path          string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HttpCall) Reset() {
+	*x = HttpCall{}
+	mi := &file_cgf_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HttpCall) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HttpCall) ProtoMessage() {}
+
+func (x *HttpCall) ProtoReflect() protoreflect.Message {
+	mi := &file_cgf_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HttpCall.ProtoReflect.Descriptor instead.
+func (*HttpCall) Descriptor() ([]byte, []int) {
+	return file_cgf_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *HttpCall) GetMethod() string {
+	if x != nil {
+		return x.Method
+	}
+	return ""
+}
+
+func (x *HttpCall) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
 // ---------------------------------------------------------------------------
-// Contract facts — the cross-repo currency (doc 02 §4).
+// Contract facts — the cross-repo currency.
 // ---------------------------------------------------------------------------
 type ProtoMessage struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1544,7 +1627,7 @@ type ProtoMessage struct {
 
 func (x *ProtoMessage) Reset() {
 	*x = ProtoMessage{}
-	mi := &file_cgf_proto_msgTypes[13]
+	mi := &file_cgf_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1556,7 +1639,7 @@ func (x *ProtoMessage) String() string {
 func (*ProtoMessage) ProtoMessage() {}
 
 func (x *ProtoMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_cgf_proto_msgTypes[13]
+	mi := &file_cgf_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1569,7 +1652,7 @@ func (x *ProtoMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProtoMessage.ProtoReflect.Descriptor instead.
 func (*ProtoMessage) Descriptor() ([]byte, []int) {
-	return file_cgf_proto_rawDescGZIP(), []int{13}
+	return file_cgf_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ProtoMessage) GetFullName() string {
@@ -1598,7 +1681,7 @@ type ProtoField struct {
 
 func (x *ProtoField) Reset() {
 	*x = ProtoField{}
-	mi := &file_cgf_proto_msgTypes[14]
+	mi := &file_cgf_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1610,7 +1693,7 @@ func (x *ProtoField) String() string {
 func (*ProtoField) ProtoMessage() {}
 
 func (x *ProtoField) ProtoReflect() protoreflect.Message {
-	mi := &file_cgf_proto_msgTypes[14]
+	mi := &file_cgf_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1623,7 +1706,7 @@ func (x *ProtoField) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProtoField.ProtoReflect.Descriptor instead.
 func (*ProtoField) Descriptor() ([]byte, []int) {
-	return file_cgf_proto_rawDescGZIP(), []int{14}
+	return file_cgf_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ProtoField) GetIndex() uint32 {
@@ -1663,7 +1746,7 @@ type PiiTag struct {
 
 func (x *PiiTag) Reset() {
 	*x = PiiTag{}
-	mi := &file_cgf_proto_msgTypes[15]
+	mi := &file_cgf_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1675,7 +1758,7 @@ func (x *PiiTag) String() string {
 func (*PiiTag) ProtoMessage() {}
 
 func (x *PiiTag) ProtoReflect() protoreflect.Message {
-	mi := &file_cgf_proto_msgTypes[15]
+	mi := &file_cgf_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1688,7 +1771,7 @@ func (x *PiiTag) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PiiTag.ProtoReflect.Descriptor instead.
 func (*PiiTag) Descriptor() ([]byte, []int) {
-	return file_cgf_proto_rawDescGZIP(), []int{15}
+	return file_cgf_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *PiiTag) GetCategory() string {
@@ -1714,7 +1797,7 @@ type GrpcMethod struct {
 
 func (x *GrpcMethod) Reset() {
 	*x = GrpcMethod{}
-	mi := &file_cgf_proto_msgTypes[16]
+	mi := &file_cgf_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1726,7 +1809,7 @@ func (x *GrpcMethod) String() string {
 func (*GrpcMethod) ProtoMessage() {}
 
 func (x *GrpcMethod) ProtoReflect() protoreflect.Message {
-	mi := &file_cgf_proto_msgTypes[16]
+	mi := &file_cgf_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1739,7 +1822,7 @@ func (x *GrpcMethod) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GrpcMethod.ProtoReflect.Descriptor instead.
 func (*GrpcMethod) Descriptor() ([]byte, []int) {
-	return file_cgf_proto_rawDescGZIP(), []int{16}
+	return file_cgf_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *GrpcMethod) GetIid() []byte {
@@ -1806,7 +1889,7 @@ type GraphqlField struct {
 	EndpointIid []byte                 `protobuf:"bytes,4,opt,name=endpoint_iid,json=endpointIid,proto3" json:"endpoint_iid,omitempty"`
 	// SDL arg name -> resolver InParam index (flow numbering, ctx = 0). Order is
 	// the SDL/generated-dispatch argument order; the core uses it to normalize a
-	// by-name client callsite (CallSite.arg_names) into positions (doc 36 §3).
+	// by-name client callsite (CallSite.arg_names) into positions.
 	Args          []*GraphqlArg `protobuf:"bytes,5,rep,name=args,proto3" json:"args,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1814,7 +1897,7 @@ type GraphqlField struct {
 
 func (x *GraphqlField) Reset() {
 	*x = GraphqlField{}
-	mi := &file_cgf_proto_msgTypes[17]
+	mi := &file_cgf_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1826,7 +1909,7 @@ func (x *GraphqlField) String() string {
 func (*GraphqlField) ProtoMessage() {}
 
 func (x *GraphqlField) ProtoReflect() protoreflect.Message {
-	mi := &file_cgf_proto_msgTypes[17]
+	mi := &file_cgf_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1839,7 +1922,7 @@ func (x *GraphqlField) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GraphqlField.ProtoReflect.Descriptor instead.
 func (*GraphqlField) Descriptor() ([]byte, []int) {
-	return file_cgf_proto_rawDescGZIP(), []int{17}
+	return file_cgf_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *GraphqlField) GetIid() []byte {
@@ -1887,7 +1970,7 @@ type GraphqlArg struct {
 
 func (x *GraphqlArg) Reset() {
 	*x = GraphqlArg{}
-	mi := &file_cgf_proto_msgTypes[18]
+	mi := &file_cgf_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1899,7 +1982,7 @@ func (x *GraphqlArg) String() string {
 func (*GraphqlArg) ProtoMessage() {}
 
 func (x *GraphqlArg) ProtoReflect() protoreflect.Message {
-	mi := &file_cgf_proto_msgTypes[18]
+	mi := &file_cgf_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1912,7 +1995,7 @@ func (x *GraphqlArg) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GraphqlArg.ProtoReflect.Descriptor instead.
 func (*GraphqlArg) Descriptor() ([]byte, []int) {
-	return file_cgf_proto_rawDescGZIP(), []int{18}
+	return file_cgf_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *GraphqlArg) GetName() string {
@@ -1929,7 +2012,110 @@ func (x *GraphqlArg) GetParamIdx() uint32 {
 	return 0
 }
 
-// Unifier over GrpcMethod/GraphqlField/HTTPRoute.
+// A server-side HTTP route: the contract a client HttpCall links to.
+type HttpRoute struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Iid         []byte                 `protobuf:"bytes,1,opt,name=iid,proto3" json:"iid,omitempty"`         // ContractIID("http:" + method + " " + path)
+	Method      string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`   // upper-case; "*" = any method
+	Path        string                 `protobuf:"bytes,3,opt,name=path,proto3" json:"path,omitempty"`       // canonical template (see HttpCall.path), no "{}" base
+	Display     string                 `protobuf:"bytes,4,opt,name=display,proto3" json:"display,omitempty"` // as written, e.g. "/api/users/{id}" — reporting only
+	HandlerIid  []byte                 `protobuf:"bytes,5,opt,name=handler_iid,json=handlerIid,proto3" json:"handler_iid,omitempty"`
+	EndpointIid []byte                 `protobuf:"bytes,6,opt,name=endpoint_iid,json=endpointIid,proto3" json:"endpoint_iid,omitempty"` // == iid
+	// Handler InParam indices (receiver excluded) that carry request data; the
+	// contract view maps each onto the client site's arg port 0.
+	RequestParams []uint32 `protobuf:"varint,7,rep,packed,name=request_params,json=requestParams,proto3" json:"request_params,omitempty"`
+	Framework     string   `protobuf:"bytes,8,opt,name=framework,proto3" json:"framework,omitempty"` // "net/http", "chi", "gin", "next-app", ... — reporting only
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HttpRoute) Reset() {
+	*x = HttpRoute{}
+	mi := &file_cgf_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HttpRoute) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HttpRoute) ProtoMessage() {}
+
+func (x *HttpRoute) ProtoReflect() protoreflect.Message {
+	mi := &file_cgf_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HttpRoute.ProtoReflect.Descriptor instead.
+func (*HttpRoute) Descriptor() ([]byte, []int) {
+	return file_cgf_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *HttpRoute) GetIid() []byte {
+	if x != nil {
+		return x.Iid
+	}
+	return nil
+}
+
+func (x *HttpRoute) GetMethod() string {
+	if x != nil {
+		return x.Method
+	}
+	return ""
+}
+
+func (x *HttpRoute) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
+func (x *HttpRoute) GetDisplay() string {
+	if x != nil {
+		return x.Display
+	}
+	return ""
+}
+
+func (x *HttpRoute) GetHandlerIid() []byte {
+	if x != nil {
+		return x.HandlerIid
+	}
+	return nil
+}
+
+func (x *HttpRoute) GetEndpointIid() []byte {
+	if x != nil {
+		return x.EndpointIid
+	}
+	return nil
+}
+
+func (x *HttpRoute) GetRequestParams() []uint32 {
+	if x != nil {
+		return x.RequestParams
+	}
+	return nil
+}
+
+func (x *HttpRoute) GetFramework() string {
+	if x != nil {
+		return x.Framework
+	}
+	return ""
+}
+
+// Unifier over GrpcMethod/GraphqlField/HttpRoute and message consumers.
 type Endpoint struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Iid            []byte                 `protobuf:"bytes,1,opt,name=iid,proto3" json:"iid,omitempty"`
@@ -1942,7 +2128,7 @@ type Endpoint struct {
 
 func (x *Endpoint) Reset() {
 	*x = Endpoint{}
-	mi := &file_cgf_proto_msgTypes[19]
+	mi := &file_cgf_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1954,7 +2140,7 @@ func (x *Endpoint) String() string {
 func (*Endpoint) ProtoMessage() {}
 
 func (x *Endpoint) ProtoReflect() protoreflect.Message {
-	mi := &file_cgf_proto_msgTypes[19]
+	mi := &file_cgf_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1967,7 +2153,7 @@ func (x *Endpoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Endpoint.ProtoReflect.Descriptor instead.
 func (*Endpoint) Descriptor() ([]byte, []int) {
-	return file_cgf_proto_rawDescGZIP(), []int{19}
+	return file_cgf_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *Endpoint) GetIid() []byte {
@@ -2002,7 +2188,7 @@ var File_cgf_proto protoreflect.FileDescriptor
 
 const file_cgf_proto_rawDesc = "" +
 	"\n" +
-	"\tcgf.proto\x12\x0fpanopticode.cgf\"\x90\x04\n" +
+	"\tcgf.proto\x12\x0fpanopticode.cgf\"\xcd\x04\n" +
 	"\n" +
 	"CgfPackage\x12\x12\n" +
 	"\x04repo\x18\x01 \x01(\tR\x04repo\x12\x1d\n" +
@@ -2017,7 +2203,9 @@ const file_cgf_proto_rawDesc = "" +
 	"\x0eproto_messages\x18\f \x03(\v2\x1d.panopticode.cgf.ProtoMessageR\rprotoMessages\x12>\n" +
 	"\fgrpc_methods\x18\r \x03(\v2\x1b.panopticode.cgf.GrpcMethodR\vgrpcMethods\x12D\n" +
 	"\x0egraphql_fields\x18\x0e \x03(\v2\x1d.panopticode.cgf.GraphqlFieldR\rgraphqlFields\x127\n" +
-	"\tendpoints\x18\x0f \x03(\v2\x19.panopticode.cgf.EndpointR\tendpoints\"+\n" +
+	"\tendpoints\x18\x0f \x03(\v2\x19.panopticode.cgf.EndpointR\tendpoints\x12;\n" +
+	"\vhttp_routes\x18\x10 \x03(\v2\x1a.panopticode.cgf.HttpRouteR\n" +
+	"httpRoutes\"+\n" +
 	"\x05Ident\x12\x10\n" +
 	"\x03iid\x18\x01 \x01(\fR\x03iid\x12\x10\n" +
 	"\x03bid\x18\x02 \x01(\fR\x03bid\"@\n" +
@@ -2091,7 +2279,7 @@ const file_cgf_proto_rawDesc = "" +
 	"\bFlowEdge\x12\x12\n" +
 	"\x04from\x18\x01 \x01(\rR\x04from\x12\x0e\n" +
 	"\x02to\x18\x02 \x01(\rR\x02to\x12\x1b\n" +
-	"\tvia_alias\x18\x03 \x01(\bR\bviaAlias\"\xa8\x05\n" +
+	"\tvia_alias\x18\x03 \x01(\bR\bviaAlias\"\xe0\x05\n" +
 	"\bCallSite\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\rR\x02id\x122\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x1e.panopticode.cgf.CallSite.KindR\x04kind\x12\x1f\n" +
@@ -2109,7 +2297,8 @@ const file_cgf_proto_rawDesc = "" +
 	"\tstream_op\x18\v \x01(\x0e2\".panopticode.cgf.CallSite.StreamOpR\bstreamOp\x12,\n" +
 	"\x12stream_client_side\x18\f \x01(\bR\x10streamClientSide\x12#\n" +
 	"\rerror_results\x18\r \x01(\x04R\ferrorResults\x12\x1b\n" +
-	"\targ_names\x18\x0e \x03(\tR\bargNames\"S\n" +
+	"\targ_names\x18\x0e \x03(\tR\bargNames\x126\n" +
+	"\thttp_call\x18\x0f \x01(\v2\x19.panopticode.cgf.HttpCallR\bhttpCall\"S\n" +
 	"\x04Kind\x12\n" +
 	"\n" +
 	"\x06STATIC\x10\x00\x12\v\n" +
@@ -2121,7 +2310,10 @@ const file_cgf_proto_rawDesc = "" +
 	"\bStreamOp\x12\x12\n" +
 	"\x0eSTREAM_OP_NONE\x10\x00\x12\x12\n" +
 	"\x0eSTREAM_OP_SEND\x10\x01\x12\x12\n" +
-	"\x0eSTREAM_OP_RECV\x10\x02\"`\n" +
+	"\x0eSTREAM_OP_RECV\x10\x02\"6\n" +
+	"\bHttpCall\x12\x16\n" +
+	"\x06method\x18\x01 \x01(\tR\x06method\x12\x12\n" +
+	"\x04path\x18\x02 \x01(\tR\x04path\"`\n" +
 	"\fProtoMessage\x12\x1b\n" +
 	"\tfull_name\x18\x01 \x01(\tR\bfullName\x123\n" +
 	"\x06fields\x18\x02 \x03(\v2\x1b.panopticode.cgf.ProtoFieldR\x06fields\"u\n" +
@@ -2155,16 +2347,27 @@ const file_cgf_proto_rawDesc = "" +
 	"\n" +
 	"GraphqlArg\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
-	"\tparam_idx\x18\x02 \x01(\rR\bparamIdx\"\xb6\x01\n" +
+	"\tparam_idx\x18\x02 \x01(\rR\bparamIdx\"\xec\x01\n" +
+	"\tHttpRoute\x12\x10\n" +
+	"\x03iid\x18\x01 \x01(\fR\x03iid\x12\x16\n" +
+	"\x06method\x18\x02 \x01(\tR\x06method\x12\x12\n" +
+	"\x04path\x18\x03 \x01(\tR\x04path\x12\x18\n" +
+	"\adisplay\x18\x04 \x01(\tR\adisplay\x12\x1f\n" +
+	"\vhandler_iid\x18\x05 \x01(\fR\n" +
+	"handlerIid\x12!\n" +
+	"\fendpoint_iid\x18\x06 \x01(\fR\vendpointIid\x12%\n" +
+	"\x0erequest_params\x18\a \x03(\rR\rrequestParams\x12\x1c\n" +
+	"\tframework\x18\b \x01(\tR\tframework\"\xc3\x01\n" +
 	"\bEndpoint\x12\x10\n" +
 	"\x03iid\x18\x01 \x01(\fR\x03iid\x122\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x1e.panopticode.cgf.Endpoint.KindR\x04kind\x12'\n" +
 	"\x0funtrusted_input\x18\x03 \x01(\bR\x0euntrustedInput\x12\x12\n" +
-	"\x04name\x18\x04 \x01(\tR\x04name\"'\n" +
+	"\x04name\x18\x04 \x01(\tR\x04name\"4\n" +
 	"\x04Kind\x12\b\n" +
 	"\x04GRPC\x10\x00\x12\v\n" +
 	"\aGRAPHQL\x10\x01\x12\b\n" +
-	"\x04HTTP\x10\x02*<\n" +
+	"\x04HTTP\x10\x02\x12\v\n" +
+	"\aMESSAGE\x10\x03*<\n" +
 	"\x06Origin\x12\x0f\n" +
 	"\vORIGIN_USER\x10\x00\x12\x11\n" +
 	"\rORIGIN_STDLIB\x10\x01\x12\x0e\n" +
@@ -2203,7 +2406,7 @@ func file_cgf_proto_rawDescGZIP() []byte {
 }
 
 var file_cgf_proto_enumTypes = make([]protoimpl.EnumInfo, 7)
-var file_cgf_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_cgf_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_cgf_proto_goTypes = []any{
 	(Origin)(0),            // 0: panopticode.cgf.Origin
 	(Generator)(0),         // 1: panopticode.cgf.Generator
@@ -2225,48 +2428,52 @@ var file_cgf_proto_goTypes = []any{
 	(*FlowVertex)(nil),     // 17: panopticode.cgf.FlowVertex
 	(*FlowEdge)(nil),       // 18: panopticode.cgf.FlowEdge
 	(*CallSite)(nil),       // 19: panopticode.cgf.CallSite
-	(*ProtoMessage)(nil),   // 20: panopticode.cgf.ProtoMessage
-	(*ProtoField)(nil),     // 21: panopticode.cgf.ProtoField
-	(*PiiTag)(nil),         // 22: panopticode.cgf.PiiTag
-	(*GrpcMethod)(nil),     // 23: panopticode.cgf.GrpcMethod
-	(*GraphqlField)(nil),   // 24: panopticode.cgf.GraphqlField
-	(*GraphqlArg)(nil),     // 25: panopticode.cgf.GraphqlArg
-	(*Endpoint)(nil),       // 26: panopticode.cgf.Endpoint
+	(*HttpCall)(nil),       // 20: panopticode.cgf.HttpCall
+	(*ProtoMessage)(nil),   // 21: panopticode.cgf.ProtoMessage
+	(*ProtoField)(nil),     // 22: panopticode.cgf.ProtoField
+	(*PiiTag)(nil),         // 23: panopticode.cgf.PiiTag
+	(*GrpcMethod)(nil),     // 24: panopticode.cgf.GrpcMethod
+	(*GraphqlField)(nil),   // 25: panopticode.cgf.GraphqlField
+	(*GraphqlArg)(nil),     // 26: panopticode.cgf.GraphqlArg
+	(*HttpRoute)(nil),      // 27: panopticode.cgf.HttpRoute
+	(*Endpoint)(nil),       // 28: panopticode.cgf.Endpoint
 }
 var file_cgf_proto_depIdxs = []int32{
 	10, // 0: panopticode.cgf.CgfPackage.functions:type_name -> panopticode.cgf.Function
 	14, // 1: panopticode.cgf.CgfPackage.types:type_name -> panopticode.cgf.Type
-	20, // 2: panopticode.cgf.CgfPackage.proto_messages:type_name -> panopticode.cgf.ProtoMessage
-	23, // 3: panopticode.cgf.CgfPackage.grpc_methods:type_name -> panopticode.cgf.GrpcMethod
-	24, // 4: panopticode.cgf.CgfPackage.graphql_fields:type_name -> panopticode.cgf.GraphqlField
-	26, // 5: panopticode.cgf.CgfPackage.endpoints:type_name -> panopticode.cgf.Endpoint
-	8,  // 6: panopticode.cgf.Function.id:type_name -> panopticode.cgf.Ident
-	0,  // 7: panopticode.cgf.Function.origin:type_name -> panopticode.cgf.Origin
-	1,  // 8: panopticode.cgf.Function.generator:type_name -> panopticode.cgf.Generator
-	9,  // 9: panopticode.cgf.Function.span:type_name -> panopticode.cgf.Span
-	11, // 10: panopticode.cgf.Function.signature:type_name -> panopticode.cgf.Signature
-	16, // 11: panopticode.cgf.Function.flow:type_name -> panopticode.cgf.LocalFlow
-	12, // 12: panopticode.cgf.Signature.params:type_name -> panopticode.cgf.Param
-	13, // 13: panopticode.cgf.Signature.returns:type_name -> panopticode.cgf.TypeRef
-	3,  // 14: panopticode.cgf.Type.kind:type_name -> panopticode.cgf.Type.Kind
-	15, // 15: panopticode.cgf.Type.fields:type_name -> panopticode.cgf.Field
-	17, // 16: panopticode.cgf.LocalFlow.vertices:type_name -> panopticode.cgf.FlowVertex
-	18, // 17: panopticode.cgf.LocalFlow.edges:type_name -> panopticode.cgf.FlowEdge
-	19, // 18: panopticode.cgf.LocalFlow.callsites:type_name -> panopticode.cgf.CallSite
-	2,  // 19: panopticode.cgf.FlowVertex.kind:type_name -> panopticode.cgf.VertexKind
-	9,  // 20: panopticode.cgf.FlowVertex.span:type_name -> panopticode.cgf.Span
-	4,  // 21: panopticode.cgf.CallSite.kind:type_name -> panopticode.cgf.CallSite.Kind
-	9,  // 22: panopticode.cgf.CallSite.span:type_name -> panopticode.cgf.Span
-	5,  // 23: panopticode.cgf.CallSite.stream_op:type_name -> panopticode.cgf.CallSite.StreamOp
-	21, // 24: panopticode.cgf.ProtoMessage.fields:type_name -> panopticode.cgf.ProtoField
-	22, // 25: panopticode.cgf.ProtoField.pii:type_name -> panopticode.cgf.PiiTag
-	25, // 26: panopticode.cgf.GraphqlField.args:type_name -> panopticode.cgf.GraphqlArg
-	6,  // 27: panopticode.cgf.Endpoint.kind:type_name -> panopticode.cgf.Endpoint.Kind
-	28, // [28:28] is the sub-list for method output_type
-	28, // [28:28] is the sub-list for method input_type
-	28, // [28:28] is the sub-list for extension type_name
-	28, // [28:28] is the sub-list for extension extendee
-	0,  // [0:28] is the sub-list for field type_name
+	21, // 2: panopticode.cgf.CgfPackage.proto_messages:type_name -> panopticode.cgf.ProtoMessage
+	24, // 3: panopticode.cgf.CgfPackage.grpc_methods:type_name -> panopticode.cgf.GrpcMethod
+	25, // 4: panopticode.cgf.CgfPackage.graphql_fields:type_name -> panopticode.cgf.GraphqlField
+	28, // 5: panopticode.cgf.CgfPackage.endpoints:type_name -> panopticode.cgf.Endpoint
+	27, // 6: panopticode.cgf.CgfPackage.http_routes:type_name -> panopticode.cgf.HttpRoute
+	8,  // 7: panopticode.cgf.Function.id:type_name -> panopticode.cgf.Ident
+	0,  // 8: panopticode.cgf.Function.origin:type_name -> panopticode.cgf.Origin
+	1,  // 9: panopticode.cgf.Function.generator:type_name -> panopticode.cgf.Generator
+	9,  // 10: panopticode.cgf.Function.span:type_name -> panopticode.cgf.Span
+	11, // 11: panopticode.cgf.Function.signature:type_name -> panopticode.cgf.Signature
+	16, // 12: panopticode.cgf.Function.flow:type_name -> panopticode.cgf.LocalFlow
+	12, // 13: panopticode.cgf.Signature.params:type_name -> panopticode.cgf.Param
+	13, // 14: panopticode.cgf.Signature.returns:type_name -> panopticode.cgf.TypeRef
+	3,  // 15: panopticode.cgf.Type.kind:type_name -> panopticode.cgf.Type.Kind
+	15, // 16: panopticode.cgf.Type.fields:type_name -> panopticode.cgf.Field
+	17, // 17: panopticode.cgf.LocalFlow.vertices:type_name -> panopticode.cgf.FlowVertex
+	18, // 18: panopticode.cgf.LocalFlow.edges:type_name -> panopticode.cgf.FlowEdge
+	19, // 19: panopticode.cgf.LocalFlow.callsites:type_name -> panopticode.cgf.CallSite
+	2,  // 20: panopticode.cgf.FlowVertex.kind:type_name -> panopticode.cgf.VertexKind
+	9,  // 21: panopticode.cgf.FlowVertex.span:type_name -> panopticode.cgf.Span
+	4,  // 22: panopticode.cgf.CallSite.kind:type_name -> panopticode.cgf.CallSite.Kind
+	9,  // 23: panopticode.cgf.CallSite.span:type_name -> panopticode.cgf.Span
+	5,  // 24: panopticode.cgf.CallSite.stream_op:type_name -> panopticode.cgf.CallSite.StreamOp
+	20, // 25: panopticode.cgf.CallSite.http_call:type_name -> panopticode.cgf.HttpCall
+	22, // 26: panopticode.cgf.ProtoMessage.fields:type_name -> panopticode.cgf.ProtoField
+	23, // 27: panopticode.cgf.ProtoField.pii:type_name -> panopticode.cgf.PiiTag
+	26, // 28: panopticode.cgf.GraphqlField.args:type_name -> panopticode.cgf.GraphqlArg
+	6,  // 29: panopticode.cgf.Endpoint.kind:type_name -> panopticode.cgf.Endpoint.Kind
+	30, // [30:30] is the sub-list for method output_type
+	30, // [30:30] is the sub-list for method input_type
+	30, // [30:30] is the sub-list for extension type_name
+	30, // [30:30] is the sub-list for extension extendee
+	0,  // [0:30] is the sub-list for field type_name
 }
 
 func init() { file_cgf_proto_init() }
@@ -2280,7 +2487,7 @@ func file_cgf_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cgf_proto_rawDesc), len(file_cgf_proto_rawDesc)),
 			NumEnums:      7,
-			NumMessages:   20,
+			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

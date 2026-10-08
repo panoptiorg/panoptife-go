@@ -9,19 +9,27 @@
 
 `pc-fe` reads a Go module and writes CGF, the input of the
 [panopticode][core] taint engine. It records how values move through each
-function, which functions each call can reach, and which gRPC and GraphQL
-endpoints each function serves or calls. A gRPC client call in one repository
-and its handler in another get the same contract id, so the engine can join
-them.
+function, which functions each call can reach, which gRPC, GraphQL and HTTP
+endpoints each function serves or calls, and which Kafka topics it writes and
+reads. A gRPC client call in one repository and its handler in another get
+the same contract id, an HTTP client request and the route it hits get the
+same method and path, and a topic is one cell for every repository, so the
+engine can join them.
+
+Supported: gRPC (protoc-gen-go-grpc), GraphQL (gqlgen), HTTP routes on
+`net/http` (incl. Go 1.22 patterns), chi v5, gin, echo v4 and gorilla/mux,
+`net/http` clients, and Kafka through segmentio/kafka-go, IBM/sarama and
+twmb/franz-go. The details and limits are in
+[How extraction works](docs/extraction.md).
 
 **Overview, diagrams and live examples: [panopti.org](https://panopti.org)**
 
 ## Quickstart
 
 You need Go 1.25 or newer, and no older than the target module's `go` line.
-`fixtures/` holds three small services that call each other: a GraphQL
-resolver in `federation` calls `backend` over gRPC, and `backend` calls
-`downstream`, which runs SQL.
+`fixtures/` holds small services that call each other. Three of them form
+the example below: a GraphQL resolver in `federation` calls `backend` over
+gRPC, and `backend` calls `downstream`, which runs SQL.
 
 ```bash
 go build -o bin/pc-fe ./cmd/pc-fe

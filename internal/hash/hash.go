@@ -13,7 +13,13 @@ import (
 
 // FQN returns a stable fully-qualified name for a function, e.g.
 // "(*gitlab.example.com/acme/ledger-svc/internal/pkg/store.Storage).Selectx".
+// A generic instance (or a function nested in one) is named from its
+// type-identity class, not from whichever caller created it — see
+// CanonicalInstances.
 func FQN(fn *ssa.Function) string {
+	if canonical(fn) {
+		return instanceFQN(fn)
+	}
 	return fn.String()
 }
 
@@ -43,8 +49,14 @@ func ContractIID(fullName string) []byte {
 	return IIDFromParts("", "", fullName, "grpc")
 }
 
-// IID is signature identity: stable across body edits.
+// IID is signature identity: stable across body edits. A generic instance's
+// signature part is SignatureString — no parameter names, no alias spelling —
+// because ssa shares one signature object among all identical instantiated
+// signatures (CanonicalInstances).
 func IID(repo string, fn *ssa.Function) []byte {
+	if canonical(fn) {
+		return IIDFromParts(repo, PackagePath(fn), instanceFQN(fn), SignatureString(fn.Signature))
+	}
 	h := sha256.New()
 	writeField(h, []byte(repo))
 	writeField(h, []byte(PackagePath(fn)))

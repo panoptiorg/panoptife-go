@@ -4,8 +4,10 @@
 // 	protoc        v6.32.1
 // source: summary.proto
 
-// Summary — the IFDS procedure summary (the jump function) and the cross-repo
-// contract wire format. Content-addressed by summary_key. See docs/04.
+// Summary — a procedure summary (the jump function) and the cross-repo
+// contract wire format. Content-addressed by summary_key. The core compiles
+// this file but does not use it: summaries are an internal Rust type stored
+// as JSON (docs/cgf.md, "Other protos").
 
 package summarypb
 

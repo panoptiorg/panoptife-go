@@ -88,7 +88,7 @@ func Extract(prog *ssa.Program, inScope map[*ssa.Package]bool, repo string) []Fi
 		disp := scanDispatchers(prog, sp.Pkg, ifaces)
 		for typeName, iface := range ifaces {
 			for _, f := range bindField(prog, inScope, repo, typeName, iface, disp, warned) {
-				key := f.TypeField + "|" + f.ResolverFn.String()
+				key := f.TypeField + "|" + hash.FQN(f.ResolverFn)
 				if seen[key] {
 					continue
 				}
@@ -102,7 +102,7 @@ func Extract(prog *ssa.Program, inScope map[*ssa.Package]bool, repo string) []Fi
 		if out[i].TypeField != out[j].TypeField {
 			return out[i].TypeField < out[j].TypeField
 		}
-		return out[i].ResolverFn.String() < out[j].ResolverFn.String()
+		return hash.FQN(out[i].ResolverFn) < hash.FQN(out[j].ResolverFn)
 	})
 	return out
 }

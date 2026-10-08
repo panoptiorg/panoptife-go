@@ -187,6 +187,30 @@ func TestNCallInstrsMatchesCallInstructionEnumeration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
+	checkNCallInstrs(t, ld, "example.com/closures", nil)
+}
+
+// Coverage wave 1 adds two more synthetic site kinds (`read:` and `http:`);
+// they must land in the tail too, after the closure bindings.
+func TestNCallInstrsWithCoverageSites(t *testing.T) {
+	ld, err := loader.Load("../../fixtures/httpclient", "./...", false, true, false, nil)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	reads, calls := checkNCallInstrs(t, ld, "example.com/httpclient", []Opts{
+		{FieldPaths: true, ClosureFlow: true, SurfaceReads: true, HTTPCalls: true, TopicCells: true},
+		{FieldPaths: true, ClosureFlow: true, SurfaceReads: true, HTTPCalls: true, HeapSlots: true, ByRefOut: true},
+	})
+	if reads == 0 || calls == 0 {
+		t.Fatalf("fixture drift: %d read: and %d http: sites checked", reads, calls)
+	}
+}
+
+// checkNCallInstrs asserts the cgstore invariant for every function of pkg
+// under each Opts (nil: the historical variants) and counts the coverage
+// synthetic sites it saw in the tail.
+func checkNCallInstrs(t *testing.T, ld *loader.Loaded, pkg string, extra []Opts) (reads, calls int) {
+	t.Helper()
 	checked := 0
 	// W1F adds a SECOND canonicalized call (the `copy` builtin), so the invariant
 	// is now per-Opts and the enumeration must use the same filter emit hands to
@@ -196,8 +220,11 @@ func TestNCallInstrsMatchesCallInstructionEnumeration(t *testing.T) {
 		{FieldPaths: true, ClosureFlow: true, HeapSlots: true},
 		{FieldPaths: true, ClosureFlow: true, HeapSlots: true, HeapAllFields: true},
 	}
+	if extra != nil {
+		variants = extra
+	}
 	for fn := range ssautil.AllFunctions(ld.Prog) {
-		if fn.Blocks == nil || fn.Pkg == nil || fn.Pkg.Pkg.Path() != "example.com/closures" {
+		if fn.Blocks == nil || fn.Pkg == nil || fn.Pkg.Pkg.Path() != pkg {
 			continue
 		}
 		for _, o := range variants {
@@ -223,6 +250,17 @@ func TestNCallInstrsMatchesCallInstructionEnumeration(t *testing.T) {
 				if cs.Id != uint32(i) {
 					t.Errorf("%s: callsite %d has id %d — ids must stay dense and ordered", fn, i, cs.Id)
 				}
+				if cs.HttpCall != nil || strings.HasPrefix(cs.CalleeFqn, "read:") {
+					t.Errorf("%s: synthetic site %q inside the real prefix", fn, cs.CalleeFqn)
+				}
+			}
+			for _, cs := range res.Flow.Callsites[res.NCallInstrs:] {
+				switch {
+				case cs.HttpCall != nil:
+					calls++
+				case strings.HasPrefix(cs.CalleeFqn, "read:"):
+					reads++
+				}
 			}
 		}
 		checked++
@@ -230,6 +268,7 @@ func TestNCallInstrsMatchesCallInstructionEnumeration(t *testing.T) {
 	if checked == 0 {
 		t.Fatal("no functions checked — fixture drift")
 	}
+	return reads, calls
 }
 
 func TestStreamPortsClientSide(t *testing.T) {

@@ -123,6 +123,15 @@ func TestKeyChangesWithInputs(t *testing.T) {
 		"cap":       func(c *Config) { c.CapN = 5 },
 		"mocks":     func(c *Config) { c.ExcludeMocks = false },
 		"gosum":     func(c *Config) { c.GoSumHash = "zzz" },
+		// coverage wave 1: every new emission flag is a namespace of its own
+		"surface-reads":     func(c *Config) { c.SurfaceReads = true },
+		"http-routes":       func(c *Config) { c.HTTPRoutes = true },
+		"http-calls":        func(c *Config) { c.HTTPCalls = true },
+		"topic-cells":       func(c *Config) { c.TopicCells = true },
+		"http-seed-request": func(c *Config) { c.HTTPSeedRequest = true },
+		// generic-instance iids (hash.CanonicalInstances)
+		"canonical-instance-ids": func(c *Config) { c.CanonicalInstances = true },
+		"heap-iface-identity":    func(c *Config) { c.HeapIfaceIdentity = true },
 	} {
 		c := base
 		mut(&c)

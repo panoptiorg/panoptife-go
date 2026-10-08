@@ -12,9 +12,16 @@ OUT=out scripts/extract-fixtures.sh dispatch   # one fixture
 ```
 
 `go test ./...` does not build the [fixtures](docs/extraction.md#fixtures),
-because each is its own module. `extract-fixtures.sh` builds `bin/pc-fe` and
-`bin/cgfstat`, extracts each fixture twice into `$OUT/<fixture>` (default
-`out`, replaced on every run) and fails unless both runs are byte-identical.
+because each is its own module; a fixture is a directory under `fixtures/`
+with a `go.mod`, one or two levels deep (`kafka/producer`). Some tests load
+fixtures that depend on real router and Kafka libraries, so they need the
+module proxy or a filled module cache. `extract-fixtures.sh` builds
+`bin/pc-fe` and `bin/cgfstat`, extracts each fixture twice into
+`$OUT/<fixture>` (default `out`, replaced on every run) and fails unless both
+runs are byte-identical.
+
+A new fixture that uses a third-party library pins it in its own `go.mod` at
+a version whose `go` line CI's Go can build (1.25), and commits its `go.sum`.
 
 ## Protobuf
 
@@ -43,5 +50,7 @@ and write the engine's short commit to `proto/PROTO_VERSION`.
 [`ci.yml`](.github/workflows/ci.yml) runs on every push and pull request, on
 Ubuntu with Go 1.25: build, vet and test; `go build ./...` in each fixture
 module; `scripts/extract-fixtures.sh`; `scripts/check-proto.sh`. CI checks
-out no engine, so the drift check skips there; run it locally before changing
-`proto/`.
+out no engine, so the drift check skips there, and so does the test that
+compares `internal/frameworks/testdata/http-canon-vectors.json` with the
+engine's `testdata/http-canon-vectors.json`; run both locally before
+changing `proto/` or the canonical HTTP path.

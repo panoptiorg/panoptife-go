@@ -27,6 +27,7 @@ import (
 	"github.com/panoptiorg/panoptife-go/internal/flow"
 	"github.com/panoptiorg/panoptife-go/internal/graphql"
 	"github.com/panoptiorg/panoptife-go/internal/hash"
+	"github.com/panoptiorg/panoptife-go/internal/httproute"
 	"github.com/panoptiorg/panoptife-go/internal/loader"
 	"github.com/panoptiorg/panoptife-go/internal/pkgclass"
 	"github.com/panoptiorg/panoptife-go/internal/satisfaction"
@@ -88,6 +89,10 @@ type Options struct {
 	// assertion cannot accept (A16, doc 30 §6.1). Ignored unless HeapSlots.
 	// Default OFF — emission change, OFF reproduces the previous CGF exactly.
 	HeapIfaceNarrow bool
+	// NoHeapIfaceIdentity restores the spelling-based HeapIfaceNarrow tags
+	// (flow.Opts.HeapIfaceIdentity), which cut alias-typed writers from their
+	// readers. Default false, i.e. identity tags.
+	NoHeapIfaceIdentity bool
 	// HeapIfaceDrop is the blunt "never open an interface-typed cell" filter.
 	// Measurement instrument only; doc 30 §7b rejected it as a shipping
 	// candidate. Ignored unless HeapSlots.
@@ -119,6 +124,30 @@ type Options struct {
 	// multi-result calls (doc 31 §6a) — the half of B1 that reaches
 	// `x, err := f()` producers, at a measured cost of 2 keys on backend-a.
 	ErrorResultsStrict bool
+	// NoCanonicalInstanceIDs restores the previous, build-order-dependent
+	// names, signatures and iids of generic instances (hash.CanonicalInstances
+	// documents the race). Default off, i.e. canonical; off reproduces the old
+	// emission byte for byte on any input where the old one was deterministic.
+	NoCanonicalInstanceIDs bool
+	// NoSurfaceReads disables the `read:` sites at loads of request fields
+	// (`r.Body`, coverage wave 1 §2.1), restoring the previous emission
+	// byte-for-byte. Default on.
+	NoSurfaceReads bool
+	// NoHTTPRoutes disables router-registration analysis (§2.2): no
+	// Endpoint{HTTP}, HttpRoute or binds_to. Default on; off reproduces the
+	// previous CGF byte-for-byte.
+	NoHTTPRoutes bool
+	// NoHTTPCalls disables the synthetic HttpCall client sites (§2.3).
+	// Default on; off reproduces the previous CGF byte-for-byte.
+	NoHTTPCalls bool
+	// NoTopicCells disables Kafka topic cells and MESSAGE endpoints (§2.4).
+	// Default on; off reproduces the previous CGF byte-for-byte.
+	NoTopicCells bool
+	// HTTPSeedRequest also adds each route handler's request_params to its
+	// source_params — whole-request seeding, which §2.1 rejects as a default
+	// because it taints every ctx the request hands out (E3). A measurement
+	// instrument, default off.
+	HTTPSeedRequest bool
 }
 
 // flowOpts is the single place the CLI's escape-hatch polarity (No*) is
@@ -132,11 +161,15 @@ func (o Options) flowOpts() flow.Opts {
 		HeapSlots:          o.HeapSlots,
 		HeapAllFields:      o.HeapSlots && o.HeapAllFields,
 		HeapIfaceNarrow:    o.HeapSlots && o.HeapIfaceNarrow,
+		HeapIfaceIdentity:  o.HeapSlots && o.HeapIfaceNarrow && !o.NoHeapIfaceIdentity,
 		HeapIfaceDrop:      o.HeapSlots && o.HeapIfaceDrop,
 		ByRefOut:           o.ByRefOut,
 		ErrorResults:       o.ErrorResults,
 		ErrorResultsStrict: o.ErrorResults && o.ErrorResultsStrict,
 		PbPaths:            o.PbPaths,
+		SurfaceReads:       !o.NoSurfaceReads,
+		HTTPCalls:          !o.NoHTTPCalls,
+		TopicCells:         !o.NoTopicCells,
 	}
 }
 
@@ -148,6 +181,7 @@ func (o Options) flowOpts() flow.Opts {
 const schemaVersion = 2
 
 func Run(o Options) error {
+	hash.CanonicalInstances = !o.NoCanonicalInstanceIDs
 	if o.Mode == "mr" && (o.Base == "" || o.Head == "") {
 		return fmt.Errorf("--mode mr requires --base and --head")
 	}
@@ -227,7 +261,7 @@ func Run(o Options) error {
 			}
 		}
 	}
-	sort.Slice(fns, func(i, j int) bool { return fns[i].String() < fns[j].String() })
+	sort.Slice(fns, func(i, j int) bool { return hash.FQN(fns[i]) < hash.FQN(fns[j]) })
 
 	// Precompute iids for all in-scope functions (needed to embed callee iids).
 	iidOf := map[*ssa.Function][]byte{}
@@ -272,6 +306,9 @@ func Run(o Options) error {
 	fo := o.flowOpts()
 	fo.Emittable = emittable
 	fo.RemoteClients = flow.BuildRemoteClientIndex(ld.Prog, o.PbPaths)
+	if fo.TopicCells {
+		fo.Topics = flow.BuildTopicIndex(ld.Prog, fns)
+	}
 	nRemoteSites := 0
 	var sc siteCensus
 	for _, fn := range fns {
@@ -331,6 +368,13 @@ func Run(o Options) error {
 	// target that never got emitted (the "dangling callee iid" warn below).
 	fmt.Fprintf(os.Stderr, "opaque: sites=%d opaque=%d capped=%d unresolved=%d dangling=%d\n",
 		sc.sites, sc.opaque, sc.capped, sc.unresolved, sc.dangling)
+	// coverage wave 1 §2.3: how many client URLs were recovered, and how many
+	// only as a suffix behind an unresolved base — the share the core's suffix
+	// match has to absorb.
+	if !o.NoHTTPCalls {
+		fmt.Fprintf(os.Stderr, "http-calls: %d sites, resolved_path=%d, dynamic_base=%d, unknown_method=%d, eval_budget=%d\n",
+			sc.http.Sites, sc.http.ResolvedPath, sc.http.DynamicBase, sc.http.UnknownMethod, sc.http.EvalBudget)
+	}
 
 	// gRPC contract facts: GRPCMethod endpoints + handler binds_to.
 	nGrpc := 0
@@ -409,17 +453,100 @@ func Run(o Options) error {
 		}
 	}
 
+	// Kafka (coverage wave 1 §2.4): the cells were emitted per function; a
+	// push consumer callback (sarama ConsumeClaim) is also an entry point —
+	// Endpoint{MESSAGE} + binds_to per topic it is bound to.
+	nMsg := 0
+	if fo.TopicCells {
+		for _, cb := range fo.Topics.Callbacks() {
+			f := fnByIID[string(iidOf[cb.Fn])]
+			if f == nil {
+				continue // bound to a callback outside the emitted set
+			}
+			cp := getPkg(hash.PackagePath(cb.Fn))
+			for _, t := range cb.Topics {
+				sym, name := flow.TopicCell(t)
+				nMsg++
+				if !hasEndpoint(cp, sym) {
+					cp.Endpoints = append(cp.Endpoints, &pb.Endpoint{
+						Iid:            sym,
+						Kind:           pb.Endpoint_MESSAGE,
+						UntrustedInput: true,
+						Name:           name,
+					})
+				}
+				if !containsIID(f.BindsTo, sym) {
+					f.BindsTo = append(f.BindsTo, sym)
+				}
+			}
+		}
+		tc := sc.topics
+		tc.Consume.Add(fo.Topics.Bind)
+		fmt.Fprintf(os.Stderr, "topics: produce=%s consume=%s cells=%d eval_budget=%d\n",
+			topicSide(tc.Produce), topicSide(tc.Consume), len(tc.Cells), tc.Produce.EvalBudget+tc.Consume.EvalBudget)
+	}
+
+	// HTTP routes (coverage wave 1 §2.2): Endpoint{HTTP} + HttpRoute + the
+	// handler's binds_to, from router registrations.
+	nHTTP := 0
+	if !o.NoHTTPRoutes {
+		routes, cen := httproute.Extract(ld.Prog, fns, disp, emittable)
+		for _, rt := range routes {
+			hid, ok := iidOf[rt.Handler]
+			if !ok {
+				continue // Extract only returns emittable handlers
+			}
+			nHTTP++
+			cp := getPkg(hash.PackagePath(rt.Handler))
+			cp.HttpRoutes = append(cp.HttpRoutes, &pb.HttpRoute{
+				Iid:           rt.IID,
+				Method:        rt.Method,
+				Path:          rt.Path,
+				Display:       rt.Display,
+				HandlerIid:    hid,
+				EndpointIid:   rt.IID,
+				RequestParams: rt.RequestParams,
+				Framework:     rt.Framework,
+			})
+			// one Endpoint per contract per package: two handlers serving
+			// the same method+path (two servers in one repo) share it
+			if !hasEndpoint(cp, rt.IID) {
+				cp.Endpoints = append(cp.Endpoints, &pb.Endpoint{
+					Iid:            rt.IID,
+					Kind:           pb.Endpoint_HTTP,
+					UntrustedInput: true,
+					Name:           rt.Method + " " + rt.Display,
+				})
+			}
+			if f := fnByIID[string(hid)]; f != nil {
+				if !containsIID(f.BindsTo, rt.IID) {
+					f.BindsTo = append(f.BindsTo, rt.IID)
+				}
+				// §2.1: the request object is NOT a source by default — it
+				// is a context.Context factory (E3). The flag exists to
+				// measure exactly that.
+				if o.HTTPSeedRequest {
+					f.SourceParams = mergeParams(f.SourceParams, rt.RequestParams)
+				}
+			}
+		}
+		fmt.Fprintf(os.Stderr, "http-routes: %d routes%s handlers_unresolved=%d prefixes_unresolved=%d eval_budget=%d\n",
+			cen.Routes, frameworkCounts(cen.ByFramework), cen.HandlersUnresolved, cen.PrefixesUnresolved, cen.EvalBudget)
+	}
+
 	// Monoculture guard (assessment §4/§9). Zero contracts AND zero remote
 	// call sites means the frontend recognised no boundary of any kind: the
 	// CGF has no entry surface and no egress, so every query over it answers
 	// "nothing". That is almost never a property of the code — it is an
 	// unsupported generator or a pb layout the heuristic does not match.
+	// HTTP routes and client sites count as boundaries (coverage wave 1 §2.2).
 	//
 	// noContracts is checked here (loud hint printed immediately) but the
 	// --require-contracts error is returned only AFTER the CGF write loop
 	// below: a CI run that hits exit 3 still gets the artifact on disk to
 	// diagnose, instead of nothing at all.
-	noContracts := nGrpc == 0 && nGql == 0 && nRemoteSites == 0
+	noContracts := nGrpc == 0 && nGql == 0 && nRemoteSites == 0 && nHTTP == 0 && sc.http.Sites == 0 &&
+		nMsg == 0 && len(sc.topics.Cells) == 0
 	if noContracts {
 		fmt.Fprint(os.Stderr, noContractsHint(o))
 	}
@@ -535,8 +662,53 @@ func Run(o Options) error {
 	return nil
 }
 
+// topicSide renders one side of the `topics:` census line.
+func topicSide(c flow.TopicSideCensus) string {
+	return fmt.Sprintf("%d (resolved %d, from_param %d, from_config %d, other %d)",
+		c.Sites, c.Resolved, c.FromParam, c.FromConfig, c.Other)
+}
+
+// hasEndpoint reports whether cp already lists the endpoint iid.
+func hasEndpoint(cp *pb.CgfPackage, iid []byte) bool {
+	for _, e := range cp.Endpoints {
+		if bytes.Equal(e.Iid, iid) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsIID(ids [][]byte, iid []byte) bool {
+	for _, id := range ids {
+		if bytes.Equal(id, iid) {
+			return true
+		}
+	}
+	return false
+}
+
+// frameworkCounts renders the census's per-framework route counts, sorted:
+// " (chi=6 gin=3)", or "" when there are none.
+func frameworkCounts(m map[string]int) string {
+	if len(m) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, m[k]))
+	}
+	return " (" + strings.Join(parts, " ") + ")"
+}
+
 // ErrNoContracts is returned under --require-contracts when the extraction
-// recognised no endpoint and no remote call site. Callers map it to exit 3.
+// recognised no endpoint and no remote call site — no gRPC method, GraphQL
+// field, HTTP route or message consumer, and no remote, HTTP client or
+// Kafka topic site. Callers map it to exit 3.
 var ErrNoContracts = errors.New("no contracts and no remote call sites extracted")
 
 // noContractsHint is the loud version of the monoculture failure (assessment
@@ -546,13 +718,18 @@ func noContractsHint(o Options) string {
 	var b strings.Builder
 	b.WriteString("\n")
 	b.WriteString("pc-fe: NO CONTRACTS AND NO REMOTE CALLS were extracted from this repo.\n")
-	b.WriteString("  The CGF has no entry surface (gRPC methods, GraphQL fields) and no egress\n")
-	b.WriteString("  (client call sites), so every query over it will answer \"nothing\".\n")
-	b.WriteString("  Recognised generators — this frontend supports exactly these:\n")
+	b.WriteString("  The CGF has no entry surface (gRPC methods, GraphQL fields, HTTP routes,\n")
+	b.WriteString("  message consumers) and no egress (client call sites, topic writes), so\n")
+	b.WriteString("  every query over it will answer \"nothing\".\n")
+	b.WriteString("  Recognised generators and libraries — this frontend supports exactly these:\n")
 	b.WriteString("    gRPC    : protoc-gen-go-grpc >= v1 (grpc-go server/client interfaces)\n")
 	b.WriteString("    GraphQL : gqlgen v2 (codegen v0.17.x ResolverRoot)\n")
+	b.WriteString("    HTTP    : net/http ServeMux, chi v5, gin, echo v4, gorilla/mux routes" + offNote(o.NoHTTPRoutes, "--http-routes") + ";\n")
+	b.WriteString("              net/http client calls" + offNote(o.NoHTTPCalls, "--http-calls") + "\n")
+	b.WriteString("    Kafka   : segmentio/kafka-go, IBM/sarama, twmb/franz-go with a constant or\n")
+	b.WriteString("              os.Getenv topic" + offNote(o.NoTopicCells, "--topic-cells") + "\n")
 	b.WriteString("    NOT supported: gogo/protobuf service plugin, connect-go, twirp, drpc,\n")
-	b.WriteString("                   plain HTTP routers (chi, gin, echo, net/http).\n")
+	b.WriteString("                   OpenAPI generators, fiber, httprouter.\n")
 	b.WriteString("  If your generated packages DO use protoc-gen-go-grpc, the package-layout\n")
 	b.WriteString("  heuristic is the likely cause: a package counts as generated only when its\n")
 	b.WriteString("  import path has one of the --pb-paths segments (currently: " + o.PbPaths.String() + ").\n")
@@ -560,6 +737,14 @@ func noContractsHint(o Options) string {
 	b.WriteString("  Also check --scope covers the packages that implement the handlers.\n")
 	b.WriteString("  Use --require-contracts to make this an error (exit 3) in CI.\n")
 	return b.String()
+}
+
+// offNote marks a supported stack whose detector this run switched off.
+func offNote(off bool, flag string) string {
+	if off {
+		return " (OFF: " + flag + "=false)"
+	}
+	return ""
 }
 
 // siteCensus tallies call-site dispatch outcomes across the whole extraction
@@ -573,6 +758,9 @@ type siteCensus struct {
 	capped     int // opaque because TargetsAt's fan-out cap tripped
 	unresolved int // interface, func-value or builtin call with zero targets, uncapped; opaque unless an interface call
 	dangling   int // resolved target whose iid was never emitted (scope gap)
+	// coverage wave 1 §2.3 / §2.4 censuses, carried up from flow.Build
+	http   flow.HTTPCallCensus
+	topics flow.TopicCensus
 }
 
 func (s *siteCensus) add(o siteCensus) {
@@ -581,6 +769,8 @@ func (s *siteCensus) add(o siteCensus) {
 	s.capped += o.capped
 	s.unresolved += o.unresolved
 	s.dangling += o.dangling
+	s.http.Add(o.http)
+	s.topics.Add(o.topics)
 }
 
 func buildFunction(repo string, disp flow.Dispatcher, fn *ssa.Function, iidOf map[*ssa.Function][]byte, capture bool, fo flow.Opts) (*pb.Function, *spb.CallerEdges, siteCensus) {
@@ -589,6 +779,8 @@ func buildFunction(repo string, disp flow.Dispatcher, fn *ssa.Function, iidOf ma
 		sites:      len(res.Flow.Callsites),
 		capped:     res.CappedSites,
 		unresolved: res.UnresolvedDynamicSites,
+		http:       res.HTTPCalls,
+		topics:     res.Topics,
 	}
 
 	var ce *spb.CallerEdges
@@ -627,7 +819,7 @@ func buildFunction(repo string, disp flow.Dispatcher, fn *ssa.Function, iidOf ma
 					// Resolver targets outside the emitted set (dep package,
 					// excluded file) produce iids no summary will ever match —
 					// the chain silently leafs there. Loud so scope gaps surface.
-					fmt.Fprintf(os.Stderr, "emit-warn: dangling callee iid: %s -> %s (target not emitted)\n", fn.String(), t.String())
+					fmt.Fprintf(os.Stderr, "emit-warn: dangling callee iid: %s -> %s (target not emitted)\n", hash.FQN(fn), hash.FQN(t))
 					sc.dangling++
 					ids = append(ids, hash.IID(repo, t))
 				}
@@ -664,7 +856,7 @@ func buildFunction(repo string, disp flow.Dispatcher, fn *ssa.Function, iidOf ma
 	file := fileOf(fn)
 	return &pb.Function{
 		Id:        &pb.Ident{Iid: iid, Bid: bid},
-		Fqn:       fn.String(),
+		Fqn:       hash.FQN(fn),
 		Package:   hash.PackagePath(fn),
 		Origin:    originOf(hash.PackagePath(fn), repo),
 		Generated: generatorOf(file) != pb.Generator_GEN_NONE,
@@ -766,12 +958,19 @@ func storeConfig(o Options, repo, mode string) (cgstore.Config, error) {
 		HeapSlots:          o.HeapSlots,
 		HeapAllFields:      o.HeapSlots && o.HeapAllFields,
 		HeapIfaceNarrow:    o.HeapSlots && o.HeapIfaceNarrow,
+		HeapIfaceIdentity:  o.HeapSlots && o.HeapIfaceNarrow && !o.NoHeapIfaceIdentity,
 		HeapIfaceDrop:      o.HeapSlots && o.HeapIfaceDrop,
 		ByRefOut:           o.ByRefOut,
 		ErrorResults:       o.ErrorResults,
 		ErrorResultsStrict: o.ErrorResults && o.ErrorResultsStrict,
 		PbPaths:            o.PbPaths.String(),
 		MockPaths:          o.MockPaths.String(),
+		SurfaceReads:       !o.NoSurfaceReads,
+		CanonicalInstances: !o.NoCanonicalInstanceIDs,
+		HTTPRoutes:         !o.NoHTTPRoutes,
+		HTTPCalls:          !o.NoHTTPCalls,
+		TopicCells:         !o.NoTopicCells,
+		HTTPSeedRequest:    !o.NoHTTPRoutes && o.HTTPSeedRequest,
 		GoSumHash:          goSum,
 	}, nil
 }
@@ -843,21 +1042,41 @@ func canonicalFlow(fl *pb.LocalFlow) []byte {
 func signatureOf(fn *ssa.Function) *pb.Signature {
 	sig := fn.Signature
 	s := &pb.Signature{HasReceiver: sig.Recv() != nil, Variadic: sig.Variadic()}
+	ts := func(t types.Type) string { return hash.TypeStringIn(fn, t) }
 	if sig.Recv() != nil {
-		s.Params = append(s.Params, &pb.Param{Name: "recv", Type: sig.Recv().Type().String()})
+		s.Params = append(s.Params, &pb.Param{Name: "recv", Type: ts(sig.Recv().Type())})
 	}
 	if params := sig.Params(); params != nil {
 		for i := 0; i < params.Len(); i++ {
 			p := params.At(i)
-			s.Params = append(s.Params, &pb.Param{Name: p.Name(), Type: p.Type().String(), ByRef: isByRef(p.Type().String())})
+			t := ts(p.Type())
+			s.Params = append(s.Params, &pb.Param{Name: paramName(fn, i, p), Type: t, ByRef: isByRef(t)})
 		}
 	}
 	if rs := sig.Results(); rs != nil {
 		for i := 0; i < rs.Len(); i++ {
-			s.Returns = append(s.Returns, &pb.TypeRef{Type: rs.At(i).Type().String()})
+			s.Returns = append(s.Returns, &pb.TypeRef{Type: ts(rs.At(i).Type())})
 		}
 	}
 	return s
+}
+
+// paramName is the declared name of parameter i. An instance's fn.Signature
+// is shared with every identical instantiated signature (hash.CanonicalInstances),
+// so its names may be another function's; the SSA parameters are created from
+// the instance's own syntax, so read the name there when they exist.
+func paramName(fn *ssa.Function, i int, p *types.Var) string {
+	if !hash.CanonicalInstances || !hash.IsInstanceLike(fn) {
+		return p.Name()
+	}
+	off := 0
+	if fn.Signature.Recv() != nil {
+		off = 1
+	}
+	if j := off + i; j < len(fn.Params) {
+		return fn.Params[j].Name()
+	}
+	return ""
 }
 
 func isByRef(typ string) bool {
