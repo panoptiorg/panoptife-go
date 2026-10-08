@@ -10,6 +10,8 @@ import (
 
 	xcg "golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/ssa"
+
+	"github.com/panoptiorg/panoptife-go/internal/hash"
 )
 
 // DefaultFanoutCap bounds per-site target enumeration. Beyond it a site is
@@ -147,7 +149,7 @@ func (r *Resolver) index(fn *ssa.Function) map[ssa.CallInstruction][]*ssa.Functi
 		if len(ts) > r.cap {
 			continue // capped-opaque: target order is never observed
 		}
-		sort.Slice(ts, func(i, j int) bool { return ts[i].String() < ts[j].String() })
+		sort.Slice(ts, func(i, j int) bool { return hash.FQN(ts[i]) < hash.FQN(ts[j]) })
 	}
 	for site := range genericHit {
 		if len(sites[site]) == 0 {

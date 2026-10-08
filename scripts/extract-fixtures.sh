@@ -7,8 +7,12 @@
 # (bid) that changes for no reason cold-starts the core's cache on every run.
 # Only a double-extract diff catches it.
 #
-#   OUT=out scripts/extract-fixtures.sh          # all fixtures
-#   OUT=out scripts/extract-fixtures.sh dispatch # one fixture
+#   OUT=out scripts/extract-fixtures.sh                 # all fixtures
+#   OUT=out scripts/extract-fixtures.sh dispatch        # one fixture
+#   OUT=out scripts/extract-fixtures.sh kafka/consumer  # a nested one
+#
+# A fixture is a directory under fixtures/ holding a go.mod, one or two
+# levels deep (fixtures/kafka/{producer,consumer} are a pair of modules).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
@@ -25,9 +29,10 @@ if [ $# -gt 0 ]; then
   FIXTURES=("$@")
 else
   FIXTURES=()
-  for d in fixtures/*/; do
-    [ -f "$d/go.mod" ] || continue
-    FIXTURES+=("$(basename "$d")")
+  for m in fixtures/*/go.mod fixtures/*/*/go.mod; do
+    [ -f "$m" ] || continue
+    d=${m%/go.mod}
+    FIXTURES+=("${d#fixtures/}")
   done
 fi
 

@@ -33,6 +33,7 @@ func main() {
 		byRefOut     bool
 		heapScope    string
 		heapNarrow   bool
+		ifaceIdent   bool
 		heapDrop     bool
 		errResults   bool
 		errStrict    bool
@@ -40,6 +41,12 @@ func main() {
 		pbPaths      string
 		mockPaths    string
 		requireContr bool
+		surfaceReads bool
+		canonInst    bool
+		httpRoutes   bool
+		httpCalls    bool
+		topicCells   bool
+		seedRequest  bool
 	)
 
 	root := &cobra.Command{
@@ -71,31 +78,38 @@ func main() {
 				return err
 			}
 			opts := emit.Options{
-				RepoDir:            args[0],
-				Scope:              scope,
-				OutDir:             outDir,
-				Mode:               mode,
-				Base:               base,
-				Head:               head,
-				Verbose:            verbose,
-				IncludeMocks:       includeMocks,
-				AllowMissingScope:  allowMissing,
-				Dispatch:           dispatch,
-				CgStoreDir:         cgStoreDir,
-				NoFieldPaths:       !fieldPaths,
-				NoClosureFlow:      !closureFlow,
-				NoContainerWrites:  !containers,
-				NoLibraryWriteback: !libWrite,
-				HeapSlots:          heapSlots,
-				HeapAllFields:      heapScope == "all",
-				HeapIfaceNarrow:    heapNarrow,
-				HeapIfaceDrop:      heapDrop,
-				ByRefOut:           byRefOut,
-				ErrorResults:       errResults,
-				ErrorResultsStrict: errStrict,
-				PbPaths:            pbp,
-				MockPaths:          mkp,
-				RequireContracts:   requireContr,
+				RepoDir:                args[0],
+				Scope:                  scope,
+				OutDir:                 outDir,
+				Mode:                   mode,
+				Base:                   base,
+				Head:                   head,
+				Verbose:                verbose,
+				IncludeMocks:           includeMocks,
+				AllowMissingScope:      allowMissing,
+				Dispatch:               dispatch,
+				CgStoreDir:             cgStoreDir,
+				NoFieldPaths:           !fieldPaths,
+				NoClosureFlow:          !closureFlow,
+				NoContainerWrites:      !containers,
+				NoLibraryWriteback:     !libWrite,
+				HeapSlots:              heapSlots,
+				HeapAllFields:          heapScope == "all",
+				HeapIfaceNarrow:        heapNarrow,
+				NoHeapIfaceIdentity:    !ifaceIdent,
+				HeapIfaceDrop:          heapDrop,
+				ByRefOut:               byRefOut,
+				ErrorResults:           errResults,
+				ErrorResultsStrict:     errStrict,
+				PbPaths:                pbp,
+				MockPaths:              mkp,
+				RequireContracts:       requireContr,
+				NoSurfaceReads:         !surfaceReads,
+				NoCanonicalInstanceIDs: !canonInst,
+				NoHTTPRoutes:           !httpRoutes,
+				NoHTTPCalls:            !httpCalls,
+				NoTopicCells:           !topicCells,
+				HTTPSeedRequest:        seedRequest,
 			}
 			return emit.Run(opts)
 		},
@@ -117,12 +131,19 @@ func main() {
 	buildCmd.Flags().BoolVar(&heapSlots, "heap-slots", false, "heap-cell in/out slots + ssa.Send + precise ssa.Select + the copy builtin; DEFAULT OFF — a program-wide object-insensitive join, opt-in until measured")
 	buildCmd.Flags().StringVar(&heapScope, "heap-slots-scope", "chan", "which struct fields become heap cells: chan (channel-typed only) | all (every field). Ignored without --heap-slots")
 	buildCmd.Flags().BoolVar(&heapNarrow, "heap-iface-narrow", false, "tag interface-typed heap cells with the concrete type on both sides (reader's type assertion, writer's MakeInterface) so the core drops pairings the assertion cannot accept. Ignored without --heap-slots; DEFAULT OFF — emission change, off must reproduce the previous CGF byte-for-byte")
+	buildCmd.Flags().BoolVar(&ifaceIdent, "heap-iface-identity", true, "with --heap-iface-narrow: tag both sides by type identity (aliases resolved), so an alias-typed write still reaches a reader asserting the aliased type; false restores the previous spelling-based tags, which dropped such true flows")
 	buildCmd.Flags().BoolVar(&heapDrop, "heap-iface-drop", false, "MEASUREMENT INSTRUMENT ONLY, never ship on: never open a heap cell for an interface-typed field. This blunt filter was measured and rejected: it disables 20-31% of the sink-carrying cell population. Exists to A/B against --heap-iface-narrow")
 	buildCmd.Flags().BoolVar(&errResults, "error-results", false, "mark which callsite results are `error`-typed (CallSite.error_results) so the core's default leaf can refuse to taint them — the largest FP class measured. Needs the core's --no-error-leaf to have any effect; DEFAULT OFF — emission change, off must reproduce the previous CGF byte-for-byte")
 	buildCmd.Flags().BoolVar(&errStrict, "error-results-strict", false, "also drop the result-TUPLE source alias for multi-result calls, so the core's error filter reaches `x, err := f()` producers and not only 1-result ones. Ignored without --error-results; DEFAULT OFF — measured at +79 FP keys removed and 2 real keys lost on one corpus, so the recall cost stays attributable")
 	buildCmd.Flags().StringVar(&pbPaths, "pb-paths", "pb,api", "comma-separated PATH SEGMENTS that mark a generated protobuf/gRPC package (matched as \"/<seg>/\" or a trailing \"/<seg>\"). This one list gates name-based remote-call recognition, stream ports, pb-getter canonicalization and gRPC handler request-param sourcing — a layout it does not match silently loses stream ports and handler request sources (calls on a generated <Svc>Client are still linked by their ...grpc.CallOption shape). Add your own: --pb-paths=pb,api,gen,proto,genproto. Rides in the cgstore key, so a change cold-starts the graph cache")
 	buildCmd.Flags().StringVar(&mockPaths, "mock-paths", "mock,mocks", "comma-separated path segments that mark a mockgen package (dropped unless --include-mocks). mockgen's own naming — a `mock_` package prefix, `_mock.go` / `zzz_` files — is always recognised and not configurable")
-	buildCmd.Flags().BoolVar(&requireContr, "require-contracts", false, "exit 3 when the extraction finds no gRPC method, no GraphQL field and no remote call site, instead of only warning. The monoculture failure mode (protoc-gen-go-grpc / gqlgen only, plus --pb-paths) otherwise looks like a successful run with an empty result — use this in CI")
+	buildCmd.Flags().BoolVar(&requireContr, "require-contracts", false, "exit 3 when the extraction finds no boundary at all — no gRPC method, GraphQL field, HTTP route or message consumer, and no remote, HTTP client or Kafka topic site — instead of only warning. An unsupported stack (or a --pb-paths miss) otherwise looks like a successful run with an empty result — use this in CI")
+	buildCmd.Flags().BoolVar(&canonInst, "canonical-instance-ids", true, "name and hash generic instances from their type arguments' identity, so the same commit always yields the same iids (go/ssa creates one instance per identity class for whichever package asks first, and packages build in parallel); false restores the previous, build-order-dependent emission")
+	buildCmd.Flags().BoolVar(&surfaceReads, "surface-reads", true, "a load of an untrusted net/http.Request field (Body, URL, Header, Form, ...) gets a synthetic `read:net/http.Request.<Field>` call site whose result flows into the loaded value, so the catalog can name it as a source; false restores the previous emission")
+	buildCmd.Flags().BoolVar(&httpRoutes, "http-routes", true, "router registrations (net/http ServeMux incl. Go 1.22 patterns, chi v5, gin, echo v4, gorilla/mux) become Endpoint{HTTP} + HttpRoute contracts bound to their handlers; false restores the previous emission")
+	buildCmd.Flags().BoolVar(&httpCalls, "http-calls", true, "net/http client calls (Get/Post/PostForm/Head, NewRequest[WithContext], the same on *http.Client) also get a synthetic `http:<METHOD> <path>` site the core links to a route; inert when nothing links. false restores the previous emission")
+	buildCmd.Flags().BoolVar(&topicCells, "topic-cells", true, "Kafka produce/consume calls (kafka-go, sarama, franz-go) with a constant or os.Getenv topic (the symbol ${env:NAME}) become heap-cell writes/reads of the message payload keyed by topic, joined across repos by the core; sarama ConsumeClaim callbacks get Endpoint{MESSAGE}. false restores the previous emission")
+	buildCmd.Flags().BoolVar(&seedRequest, "http-seed-request", false, "MEASUREMENT INSTRUMENT: also add each HTTP route handler's request parameters (r, c) to source_params. Off by default because a whole-request seed taints every context.Context the request hands out. Ignored with --http-routes=false")
 	buildCmd.Flags().BoolVar(&byRefOut, "byref-out", false, "by-ref param/receiver out-slots + the caller-side arg back-edge; DEFAULT OFF — an emission change, so off must reproduce the previous CGF byte-for-byte")
 
 	root.AddCommand(buildCmd)

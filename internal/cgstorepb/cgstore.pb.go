@@ -4,12 +4,11 @@
 // 	protoc        v6.32.1
 // source: cgstore.proto
 
-// cgstore — the persisted call-graph snapshot (R4 Ph1, incremental_callgraph_spec
-// §4/§8). One Meta + one PkgShard per package, under
-// output/cgstore/<repo>/<hex12(storeKey)>/<commit12>/. Go frontend only — the
-// Rust core never reads this. Versioned separately from cgf.proto: any breaking
-// change bumps schema_version, which is folded into storeKey (old snapshots
-// simply miss and a full rebuild rewrites them).
+// cgstore — the persisted call-graph snapshot. One Meta + one PkgShard per
+// package, under output/cgstore/<repo>/<hex12(storeKey)>/<commit12>/. Go
+// frontend only — the Rust core never reads this. Versioned separately from
+// cgf.proto: any breaking change bumps schema_version, which is folded into
+// storeKey (old snapshots simply miss and a full rebuild rewrites them).
 
 package cgstorepb
 
@@ -58,7 +57,7 @@ type Meta struct {
 	// CallSites, so CallSite.Id ordinals only align with a matching-mode
 	// enumeration (snapshot.go filters canonicalized calls when true).
 	FieldPaths bool `protobuf:"varint,18,opt,name=field_paths,json=fieldPaths,proto3" json:"field_paths,omitempty"`
-	// --closure-flow at capture time (W1d). Recorded for the same reason as
+	// --closure-flow at capture time. Recorded for the same reason as
 	// field_paths: it changes CGF bytes. It does NOT change CallSite.Id alignment
 	// — the synthetic binding sites are appended after every real one and
 	// n_callsites counts only the real ones — so snapshot.go needs no filter for

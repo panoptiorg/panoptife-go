@@ -32,6 +32,7 @@ import (
 
 	"github.com/panoptiorg/panoptife-go/internal/callgraph"
 	pb "github.com/panoptiorg/panoptife-go/internal/cgfpb"
+	"github.com/panoptiorg/panoptife-go/internal/frameworks"
 	"github.com/panoptiorg/panoptife-go/internal/hash"
 	"github.com/panoptiorg/panoptife-go/internal/pkgclass"
 )
@@ -52,8 +53,9 @@ type Result struct {
 	Callees []Callee
 	// NCallInstrs is how many of Flow.Callsites are backed by a real
 	// ssa.CallInstruction — always a PREFIX, ids 0..NCallInstrs-1. The tail is
-	// the synthetic closure-binding sites, which `*ssa.MakeClosure` is NOT a
-	// CallInstruction for. cgstore's snapshot ordinal key
+	// the synthetic sites: closure bindings (`*ssa.MakeClosure` is NOT a
+	// CallInstruction), `read:` surface reads and HTTP client sites (coverage
+	// wave 1 §2.1, §2.3). cgstore's snapshot ordinal key
 	// (callgraph.callInstructions) re-enumerates CallInstructions, so it must
 	// validate against THIS count, never len(Flow.Callsites).
 	NCallInstrs int
@@ -70,6 +72,28 @@ type Result struct {
 	// CappedSites: a function-value or builtin call gets cs.Opaque=true, an
 	// interface call does not. Census-only.
 	UnresolvedDynamicSites int
+	// HTTPCalls is the §2.3 census of this function's synthetic client sites.
+	HTTPCalls HTTPCallCensus
+	// Topics is the §2.4 census of this function's topic produces/consumes.
+	Topics TopicCensus
+}
+
+// HTTPCallCensus counts synthetic HTTP client sites (pc-fe's `http-calls:`
+// stderr line; not part of the CGF).
+type HTTPCallCensus struct {
+	Sites         int // synthetic HttpCall sites emitted
+	ResolvedPath  int // ... whose canonical path has a literal segment
+	DynamicBase   int // ... whose URL starts with an unresolved base
+	UnknownMethod int // ... whose method is not a constant
+	EvalBudget    int // ... whose URL or method ran out of evaluator budget
+}
+
+func (c *HTTPCallCensus) Add(o HTTPCallCensus) {
+	c.Sites += o.Sites
+	c.ResolvedPath += o.ResolvedPath
+	c.DynamicBase += o.DynamicBase
+	c.UnknownMethod += o.UnknownMethod
+	c.EvalBudget += o.EvalBudget
 }
 
 // Dispatcher resolves virtual-dispatch targets per call site: the live
@@ -104,6 +128,11 @@ type Opts struct {
 	// Default OFF: an emission change, so OFF must reproduce the previous CGF
 	// byte-for-byte or the A/B is not attributable.
 	HeapIfaceNarrow bool
+	// HeapIfaceIdentity makes the HeapIfaceNarrow tags compare type IDENTITY
+	// rather than spelling (see ifaceTag). Default on; false restores the
+	// previous spelling-based tags byte for byte. Meaningful only with
+	// HeapIfaceNarrow.
+	HeapIfaceIdentity bool
 	// HeapIfaceDrop is the BLUNT filter — never open a cell for an
 	// interface-typed field at all. **Measurement instrument only.** doc 30 §7b
 	// sized it and rejected it as a shipping candidate: it happens to cost ~3
@@ -175,6 +204,26 @@ type Opts struct {
 	// stream ports and pb-getter canonicalization at once, so it rides in the
 	// cgstore key (Config.PbPaths).
 	PbPaths pkgclass.PbPaths
+	// SurfaceReads: a load of a field in frameworks.SurfaceReads
+	// (`r.Body`, `r.URL`, …) gets a synthetic zero-arg `read:` call site whose
+	// result port flows into the loaded value (coverage wave 1 §2.1, E2). The
+	// ordinary operand edge from the base object stays, so a summary still sees
+	// `Param(r) -> …` — the TS frontend's readCallsite contract.
+	SurfaceReads bool
+	// HTTPCalls: at a frameworks.ClientCalls call, a synthetic `http:` site
+	// (argc 1, resultc 0, HttpCall set) is emitted in addition to the ordinary
+	// one, with every data-bearing argument flowing into its arg port 0
+	// (§2.3). resultc 0 makes it inert until the core links it to a route.
+	HTTPCalls bool
+	// TopicCells: Kafka produce/consume calls become heap-cell writes/reads
+	// keyed by topic (§2.4) — OUT_FIELD / IN_GLOBAL vertices exactly like
+	// --heap-slots' field cells, but independent of that flag.
+	TopicCells bool
+	// Topics carries the push-style consumer callbacks (sarama ConsumeClaim)
+	// and the topics bound to them; built once per program by
+	// BuildTopicIndex. nil: none. Not part of any cache key (derived from the
+	// program like RemoteClients).
+	Topics *TopicIndex
 }
 
 type builder struct {
@@ -194,6 +243,17 @@ type builder struct {
 	// Result.UnresolvedDynamicSites.
 	nCapped     int
 	nUnresolved int
+
+	// §2.1 surface reads and §2.3 client calls, in fn.Blocks/Instrs order:
+	// their synthetic sites are appended after the closure bindings, for the
+	// same cgstore reason (see emitClosureBindings).
+	reads   []surfaceRead
+	clients []clientCall
+	httpC   HTTPCallCensus
+	// §2.4 topic cells, pending until emitTopicCells
+	topicWrites []topicWrite
+	topicReads  []topicRead
+	topicC      TopicCensus
 
 	// value-flow adjacency over ssa.Values (call-barriered)
 	succ map[ssa.Value][]edge
@@ -256,8 +316,14 @@ func Build(fn *ssa.Function, res Dispatcher, o Opts) *Result {
 	}
 	b.assignParams()
 	b.emitByRefOuts()
+	if o.TopicCells {
+		b.topicParamHook()
+	}
 	b.scanInstrs()
 	b.emitClosureBindings()
+	b.emitSurfaceReads()
+	b.emitHTTPCalls()
+	b.emitTopicCells()
 	b.wireExtracts()
 	if o.FieldPaths {
 		b.emitAccessVariants()
@@ -282,7 +348,18 @@ func Build(fn *ssa.Function, res Dispatcher, o Opts) *Result {
 		NCallInstrs:            b.nCallInstrs,
 		CappedSites:            b.nCapped,
 		UnresolvedDynamicSites: b.nUnresolved,
+		HTTPCalls:              b.httpC,
+		Topics:                 b.topicC,
 	}
+}
+
+// typeStr is the type string of a value in this function. Inside a generic
+// instance it is the canonical form (hash.TypeStringIn): the instance's types
+// are substituted from whichever caller created it first, so their alias
+// spelling and parameter names are not a property of the function. Everywhere
+// else it is t.String(), byte-identical to before.
+func (b *builder) typeStr(t types.Type) string {
+	return hash.TypeStringIn(b.fn, t)
 }
 
 func (b *builder) addVertex(kind pb.VertexKind, index, callsite uint32, typ string, span *pb.Span) uint32 {
@@ -304,12 +381,12 @@ func (b *builder) assignParams() {
 	paramIdx := uint32(0)
 	for i, p := range b.fn.Params {
 		if i == 0 && hasRecv {
-			v := b.addVertex(pb.VertexKind_IN_RECEIVER, 0, 0, p.Type().String(), nil)
+			v := b.addVertex(pb.VertexKind_IN_RECEIVER, 0, 0, b.typeStr(p.Type()), nil)
 			b.srcVerts[p] = append(b.srcVerts[p], v)
 			b.ordered = append(b.ordered, srcEntry{p, v})
 			continue
 		}
-		v := b.addVertex(pb.VertexKind_IN_PARAM, paramIdx, 0, p.Type().String(), nil)
+		v := b.addVertex(pb.VertexKind_IN_PARAM, paramIdx, 0, b.typeStr(p.Type()), nil)
 		b.srcVerts[p] = append(b.srcVerts[p], v)
 		b.ordered = append(b.ordered, srcEntry{p, v})
 		paramIdx++
@@ -335,7 +412,7 @@ func (b *builder) assignParams() {
 	// neither has a receiver — the `hasRecv` shift above is a no-op for them.
 	// The subtraction is kept anyway so the two numberings can never drift.
 	for i, fv := range b.fn.FreeVars {
-		v := b.addVertex(pb.VertexKind_IN_PARAM, paramIdx+uint32(i), 0, fv.Type().String(), nil)
+		v := b.addVertex(pb.VertexKind_IN_PARAM, paramIdx+uint32(i), 0, b.typeStr(fv.Type()), nil)
 		b.srcVerts[fv] = append(b.srcVerts[fv], v)
 		b.ordered = append(b.ordered, srcEntry{fv, v})
 	}
@@ -381,7 +458,7 @@ func (b *builder) emitByRefOuts() {
 			// would land on the first real argument. doc 29 §1b.
 			kind, idx = pb.VertexKind_OUT_RECEIVER_BYREF, 0
 		}
-		v := b.addVertex(kind, idx, 0, p.Type().String(), nil)
+		v := b.addVertex(kind, idx, 0, b.typeStr(p.Type()), nil)
 		b.sinkVerts[p] = append(b.sinkVerts[p], v)
 		if !recv {
 			paramIdx++
@@ -453,19 +530,19 @@ func (b *builder) emitClosureBindings() {
 		}
 		csID := uint32(len(b.flow.Callsites))
 		for i, bind := range mc.Bindings {
-			v := b.addVertex(pb.VertexKind_CALL_ARG_PORT, base+uint32(i), csID, bind.Type().String(), nil)
+			v := b.addVertex(pb.VertexKind_CALL_ARG_PORT, base+uint32(i), csID, b.typeStr(bind.Type()), nil)
 			b.sinkVerts[bind] = append(b.sinkVerts[bind], v)
 		}
 		b.flow.Callsites = append(b.flow.Callsites, &pb.CallSite{
 			Id:                 csID,
 			Kind:               pb.CallSite_STATIC,
 			DispatchConfidence: 1.0,
-			CalleeFqn:          fn.String(),
+			CalleeFqn:          hash.FQN(fn),
 			Argc:               base + uint32(len(mc.Bindings)),
 			Resultc:            0,
 			Span:               span,
 		})
-		b.callees = append(b.callees, Callee{FQN: fn.String(), Static: fn, Kind: pb.CallSite_STATIC})
+		b.callees = append(b.callees, Callee{FQN: hash.FQN(fn), Static: fn, Kind: pb.CallSite_STATIC})
 	}
 }
 
@@ -476,6 +553,12 @@ func (b *builder) scanInstrs() {
 			// with --heap-slots off heapHook returns immediately, so the switch
 			// below is the sole emitter and the tree is byte-identical to d6fdacd.
 			b.heapHook(instr)
+			// §2.1: likewise additive — a no-op with --surface-reads off.
+			b.surfaceHook(instr)
+			// §2.4: a send on an async producer's Input() channel.
+			if snd, ok := instr.(*ssa.Send); ok && b.opts.TopicCells {
+				b.topicSendHook(snd)
+			}
 			switch it := instr.(type) {
 			case *ssa.Call:
 				b.handleCall(it, pb.CallSite_STATIC)
@@ -520,7 +603,7 @@ func (b *builder) scanInstrs() {
 				}
 			case *ssa.Return:
 				for j, r := range it.Results {
-					v := b.addVertex(pb.VertexKind_OUT_RETURN, uint32(j), 0, r.Type().String(), b.span(it))
+					v := b.addVertex(pb.VertexKind_OUT_RETURN, uint32(j), 0, b.typeStr(r.Type()), b.span(it))
 					b.sinkVerts[r] = append(b.sinkVerts[r], v)
 				}
 			case *ssa.Select:
@@ -635,11 +718,11 @@ func (b *builder) handleCall(instr ssa.CallInstruction, kind pb.CallSite_Kind) {
 		args = cc.Args
 		if sc := cc.StaticCallee(); sc != nil {
 			callee.Static = sc
-			callee.FQN = sc.String()
+			callee.FQN = hash.FQN(sc)
 			arg0Recv = sc.Signature.Recv() != nil
 		} else {
 			// dynamic func value: resolve via the call graph if possible
-			callee.FQN = cc.Value.Type().String()
+			callee.FQN = b.typeStr(cc.Value.Type())
 			targets, conf, capped := b.res.TargetsAt(instr)
 			callee.Targets = targets
 			cs.DispatchConfidence = conf
@@ -677,7 +760,7 @@ func (b *builder) handleCall(instr ssa.CallInstruction, kind pb.CallSite_Kind) {
 
 	// arg ports
 	for i, a := range args {
-		v := b.addVertex(pb.VertexKind_CALL_ARG_PORT, uint32(i), csID, a.Type().String(), nil)
+		v := b.addVertex(pb.VertexKind_CALL_ARG_PORT, uint32(i), csID, b.typeStr(a.Type()), nil)
 		b.sinkVerts[a] = append(b.sinkVerts[a], v)
 		// W1a: the caller-side back-edge. An arg port is sink-only otherwise, so
 		// `propagate` deposits a callee's by-ref out-fact on this vertex and then
@@ -748,6 +831,15 @@ func (b *builder) handleCall(instr ssa.CallInstruction, kind pb.CallSite_Kind) {
 
 	b.flow.Callsites = append(b.flow.Callsites, cs)
 	b.callees = append(b.callees, callee)
+
+	if b.opts.HTTPCalls {
+		if c, cargs, ok := frameworks.MatchClientCall(cc); ok {
+			b.clients = append(b.clients, clientCall{instr: instr, call: c, args: cargs})
+		}
+	}
+	if b.opts.TopicCells {
+		b.topicHook(instr)
+	}
 }
 
 // emittable: does fn's body reach the core (so it gets a summary)?
@@ -919,12 +1011,24 @@ func isChanField(t types.Type) bool {
 	return ok
 }
 
-// typeTag is the A16 discriminant: a rename-unstable but program-wide-consistent
+// ifaceTag is the A16 discriminant: a rename-unstable but program-wide-consistent
 // identity for one CONCRETE type, hashed so the core can compare two of them
 // without carrying Go type strings (which contain '[' and would collide with
 // slot_str's field-path syntax).
-func typeTag(t types.Type) []byte {
-	return hash.IIDFromParts("", "", "type:"+t.String(), "")
+//
+// Under HeapIfaceIdentity it hashes the type's IDENTITY (hash.TypeString:
+// aliases resolved, parameter names dropped). `.(string)` accepts a value of
+// type `model.Query` when `type Query = string`, and the filter must agree with
+// the language: the raw t.String() tag compared spellings, so a write whose
+// value was alias-typed was cut from a reader asserting the target type (a lost
+// true flow), and inside a generic instance the spelling came from whichever
+// caller instantiated it first, so narrowing changed with build order.
+func (b *builder) ifaceTag(t types.Type) []byte {
+	s := t.String()
+	if b.opts.HeapIfaceIdentity {
+		s = hash.TypeString(t)
+	}
+	return hash.IIDFromParts("", "", "type:"+s, "")
 }
 
 // assertsOf returns the type assertions applied to v, and whether they are v's
@@ -993,23 +1097,20 @@ func (b *builder) heapRead(typ types.Type, field int, v ssa.Value) {
 	if b.opts.HeapIfaceNarrow && iface {
 		if tas, only := assertsOf(v); only {
 			for _, ta := range tas {
-				id := b.addVertex(pb.VertexKind_IN_GLOBAL, 0, 0, ta.Type().String(), nil)
+				id := b.addVertex(pb.VertexKind_IN_GLOBAL, 0, 0, b.typeStr(ta.Type()), nil)
 				vx := b.flow.Vertices[id]
 				vx.Sym, vx.SymName = sym, name
 				// An assertion to an INTERFACE is not a discriminant we can
 				// check without method sets, so it narrows nothing (sound).
 				if !types.IsInterface(ta.AssertedType) {
-					vx.IfaceType = typeTag(ta.AssertedType)
+					vx.IfaceType = b.ifaceTag(ta.AssertedType)
 				}
 				b.srcVerts[ta] = append(b.srcVerts[ta], id)
 			}
 			return
 		}
 	}
-	id := b.addVertex(pb.VertexKind_IN_GLOBAL, 0, 0, v.Type().String(), nil)
-	vx := b.flow.Vertices[id]
-	vx.Sym, vx.SymName = sym, name
-	b.srcVerts[v] = append(b.srcVerts[v], id)
+	b.cellRead(sym, name, v)
 }
 
 // heapWrite marks val as flowing INTO the cell: an OUT_FIELD out-slot carrying
@@ -1020,19 +1121,16 @@ func (b *builder) heapWrite(typ types.Type, field int, val ssa.Value, span *pb.S
 	if !ok {
 		return
 	}
-	id := b.addVertex(pb.VertexKind_OUT_FIELD, 0, 0, val.Type().String(), span)
-	vx := b.flow.Vertices[id]
-	vx.Sym, vx.SymName = sym, name
+	id := b.cellWrite(sym, name, val, span)
 	// A16: which concrete type THIS write deposits in the cell. The vertex's own
 	// `type` is the interface (that is what is being stored), so the boxing has
 	// to be peeled. Filtered per write site in the core's `propagate`, which is
 	// where the existing per-write-site path filter already lives.
 	if b.opts.HeapIfaceNarrow && iface {
 		if ct, ok := concreteStored(val); ok {
-			vx.IfaceType = typeTag(ct)
+			b.flow.Vertices[id].IfaceType = b.ifaceTag(ct)
 		}
 	}
-	b.sinkVerts[val] = append(b.sinkVerts[val], id)
 }
 
 // chanCellOf resolves the heap cell a channel VALUE was loaded from, walking

@@ -27,8 +27,9 @@ jobs:
       - name: fixtures build
         run: |
           set -e
-          for d in fixtures/*/; do
-            [ -f "$d/go.mod" ] || continue
+          for m in fixtures/*/go.mod fixtures/*/*/go.mod; do
+            [ -f "$m" ] || continue
+            d=${m%/go.mod}
             echo "== $d"
             (cd "$d" && go build ./...)
           done

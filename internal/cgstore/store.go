@@ -64,6 +64,9 @@ type Config struct {
 	// snapshot written under a different setting belongs in its own namespace.
 	HeapIfaceNarrow bool
 	HeapIfaceDrop   bool
+	// HeapIfaceIdentity: --heap-iface-identity. Changes the A16 tags under
+	// --heap-iface-narrow — its own namespace.
+	HeapIfaceIdentity bool
 	// ByRefOut: --byref-out (W1a). CallSite.Id alignment is untouched — it adds
 	// vertices and srcVerts entries only — but it changes CGF bytes, so a
 	// snapshot written under a different setting must live in its own namespace.
@@ -81,7 +84,24 @@ type Config struct {
 	// cache, hence the key.
 	PbPaths   string
 	MockPaths string
-	GoSumHash string // hex sha256 of the repo's go.sum ("" if none)
+	// SurfaceReads / HTTPCalls: --surface-reads / --http-calls (coverage wave
+	// 1 §2.1, §2.3). Both append synthetic CallSites AFTER the real ones, so
+	// CallSite.Id alignment of the replayed prefix is untouched — but they
+	// change CGF bytes, so a snapshot written under a different setting
+	// belongs in its own namespace.
+	SurfaceReads bool
+	HTTPCalls    bool
+	// CanonicalInstances: --canonical-instance-ids. Changes the iids of generic
+	// instances, which a snapshot stores — its own namespace.
+	CanonicalInstances bool
+	// HTTPRoutes / HTTPSeedRequest / TopicCells: --http-routes,
+	// --http-seed-request, --topic-cells (§2.2, §2.4). Contract facts,
+	// source_params and heap-cell vertices only — no call site moves — but CGF
+	// bytes change, hence the key.
+	HTTPRoutes      bool
+	HTTPSeedRequest bool
+	TopicCells      bool
+	GoSumHash       string // hex sha256 of the repo's go.sum ("" if none)
 }
 
 // Key hashes the config sha256 length-prefixed (same discipline as hash.IID —
@@ -93,9 +113,12 @@ func (c Config) Key() []byte {
 		fmt.Sprintf("%d", c.CapN), fmt.Sprintf("%t", c.ExcludeMocks),
 		fmt.Sprintf("%t", c.FieldPaths), fmt.Sprintf("%t", c.ClosureFlow),
 		fmt.Sprintf("%t", c.HeapSlots), fmt.Sprintf("%t", c.HeapAllFields),
-		fmt.Sprintf("%t", c.HeapIfaceNarrow), fmt.Sprintf("%t", c.HeapIfaceDrop),
+		fmt.Sprintf("%t", c.HeapIfaceNarrow), fmt.Sprintf("%t", c.HeapIfaceDrop), fmt.Sprintf("%t", c.HeapIfaceIdentity),
 		fmt.Sprintf("%t", c.ByRefOut), fmt.Sprintf("%t", c.ErrorResults), fmt.Sprintf("%t", c.ErrorResultsStrict),
 		fmt.Sprintf("%t", c.ContainerWrites), fmt.Sprintf("%t", c.LibraryWriteback),
+		fmt.Sprintf("%t", c.SurfaceReads), fmt.Sprintf("%t", c.HTTPRoutes), fmt.Sprintf("%t", c.HTTPCalls),
+		fmt.Sprintf("%t", c.CanonicalInstances),
+		fmt.Sprintf("%t", c.TopicCells), fmt.Sprintf("%t", c.HTTPSeedRequest),
 		c.PbPaths, c.MockPaths, c.GoSumHash, fmt.Sprintf("%d", SchemaVersion),
 	} {
 		writeField(h, f)

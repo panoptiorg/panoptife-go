@@ -34,8 +34,16 @@ repo=example.com/backend commit=22817b1b packages=3 functions=23 out=out/cgf/bac
 
 In `--mode mr` a line `mr base=<sha> head=<sha> changed_files=<n> changed_fns=<n>`
 precedes it. Everything else goes to stderr: a `pc-fe timing:` line, the
-`opaque:` census, and the warnings listed in
-[extraction.md](extraction.md#warnings).
+`opaque:` census, the HTTP and Kafka census lines, and the warnings listed in
+[extraction.md](extraction.md#warnings):
+
+```text
+http-calls: 4 sites, resolved_path=4, dynamic_base=3, unknown_method=1, eval_budget=0
+topics: produce=6 (resolved 5, from_param 1, from_config 0, other 0) consume=0 (resolved 0, from_param 0, from_config 0, other 0) cells=3 eval_budget=0
+http-routes: 19 routes (chi=6 echo=2 gin=3 gorilla=4 net/http=4) handlers_unresolved=0 prefixes_unresolved=0 eval_budget=0
+```
+
+Each is printed only when its flag is on.
 
 ### Flags
 
@@ -54,7 +62,7 @@ Input and output:
 | `--include-mocks` | `false` | build and emit mock packages instead of dropping them. Files named `*_mock.go` or `zzz_*` are excluded either way |
 | `--mock-paths` | `mock,mocks` | path segments that mark a mock package. Each entry must be a single segment |
 | `--pb-paths` | `pb,api` | path segments that mark a generated protobuf package: the import path contains `/<seg>/` or ends in `/<seg>`. Each entry must be a single segment. Controls remote-call recognition, stream ports, getter canonicalisation and which handler parameters are untrusted |
-| `--require-contracts` | `false` | exit 3 when no gRPC method, GraphQL field or remote call site was extracted. The CGF is written first |
+| `--require-contracts` | `false` | exit 3 when no boundary was extracted: no gRPC method, GraphQL field, HTTP route or message consumer, and no remote call, HTTP client or Kafka topic site. The CGF is written first |
 
 `--pb-paths` and `--mock-paths` replace their default list. To add a segment,
 repeat the defaults: `--pb-paths=pb,api,gen,proto`.
@@ -91,10 +99,24 @@ every one of these changes the CGF bytes and is part of the cgstore key.
 | `--heap-slots` | `false` | struct fields become program-wide heap cells joining writers and readers; also channel sends, `select` and `copy` |
 | `--heap-slots-scope` | `chan` | with `--heap-slots`: `chan` (channel-typed fields only) or `all` |
 | `--heap-iface-narrow` | `false` | with `--heap-slots`: tag interface-typed cells with the concrete type so the core can drop impossible pairings |
+| `--heap-iface-identity` | `true` | with `--heap-iface-narrow`: both sides' tags hash the type's identity (aliases resolved, parameter names dropped), so a write whose value is alias-typed still reaches a reader asserting the aliased type. `=false` restores the previous spelling-based tags, which cut such true flows and, inside generic instances, changed with build order |
 | `--heap-iface-drop` | `false` | with `--heap-slots`: never create cells for interface-typed fields. Experimental; loses real flows |
 | `--byref-out` | `false` | out-slots for every pointer, slice and map parameter and receiver (and channel, with `--container-writes`), plus the caller-side back-edge |
 | `--error-results` | `false` | record which call results are `error`-typed (`CallSite.error_results`), for the core's `--no-error-leaf` |
 | `--error-results-strict` | `false` | with `--error-results`: also drop the whole-tuple alias for multi-result calls |
+
+HTTP and Kafka. Each `true` default is turned off with `=false`, which
+reproduces the CGF of a `pc-fe` without the feature byte for byte; each is part
+of the cgstore key. See [extraction.md](extraction.md#http-routes).
+
+| flag | default | meaning |
+|---|---|---|
+| `--canonical-instance-ids` | `true` | name and hash a generic instance (and functions nested in it) from its type arguments' identity — aliases resolved, parameter names dropped — so the same commit always yields the same CGF. `=false` restores the previous names and iids, which depended on which package instantiated the generic first in the parallel build; see [extraction.md](extraction.md#6-identity) |
+| `--surface-reads` | `true` | a load of `Body`, `Form`, `PostForm`, `MultipartForm`, `Header`, `Trailer`, `URL`, `Host` or `RequestURI` of a `*net/http.Request` gets a synthetic `read:net/http.Request.<Field>` call site whose result flows into the loaded value, so a catalog source rule can name it |
+| `--http-routes` | `true` | router registrations (`net/http` `ServeMux` incl. Go 1.22 patterns, chi v5, gin, echo v4, gorilla/mux) become `Endpoint{HTTP}` and `HttpRoute` facts bound to their handlers |
+| `--http-calls` | `true` | `net/http` client calls get an extra synthetic `http:<METHOD> <path>` site that the core links to a route |
+| `--topic-cells` | `true` | Kafka produce and consume calls (segmentio/kafka-go, IBM/Shopify sarama, twmb/franz-go) whose topic resolves become heap-cell writes and reads of the message payload, keyed by topic (an `os.Getenv("X")` topic is the symbol `${env:X}`); sarama `ConsumeClaim` callbacks get `Endpoint{MESSAGE}` |
+| `--http-seed-request` | `false` | with `--http-routes`: also add each route handler's request parameters (`r`, `c`) to `source_params`. A measurement instrument: a whole request taints every `context.Context` it hands out |
 
 ### Exit codes
 
@@ -102,7 +124,7 @@ every one of these changes the CGF bytes and is part of the cgstore key.
 |---|---|
 | 0 | success, including a run with no contracts when `--require-contracts` is not set, and a failed cgstore write |
 | 1 | any error: wrong argument count, invalid flag value, `--mode mr` without `--base`/`--head`, load failure or a load guard (toolchain skew, most packages failing to type-check, missing scope package), write failure, `git diff` failure |
-| 3 | `--require-contracts` and nothing was found |
+| 3 | `--require-contracts` and no boundary was found |
 
 Errors are printed once to stderr as `error: <message>`.
 
@@ -118,6 +140,7 @@ available, for `rev-parse`, `status` (cgstore) and `diff` (`mr` mode).
 ```text
 cgfdump [-flow <substring>] <file.pb>
 cgfdump -sites <file.pb | dir>
+cgfdump -contracts <file.pb | dir>
 ```
 
 Decodes one CGF file and prints each function and its call sites:
@@ -128,16 +151,21 @@ FN (*example.com/backend/app.Implementation).GetAccount iid=6fc27fbafc52 src_par
 ```
 
 `iid` is truncated to 12 hex digits, `src_params` are the untrusted
-parameter indices, `binds` counts the contracts the function implements.
+parameter indices, `binds` counts the contracts the function implements. A
+synthetic HTTP client site ends in `http="<METHOD>" <path>`.
 
 | flag | default | meaning |
 |---|---|---|
 | `-flow` | empty | also print flow vertices and edges for functions whose name contains the substring |
 | `-sites` | `false` | one tab-separated row per call site instead: function, call-site id, opaque, confidence, comma-separated full callee iids. Accepts a directory |
+| `-contracts` | `false` | the package's contract facts instead: one `ENDPOINT`, `GRPC`, `GRAPHQL` or `HTTP` line each, the HTTP line with method, canonical path, display path, framework, request parameters and handler. Accepts a directory |
 
-It does not print the package's contract lists (`grpc_methods`,
-`graphql_fields`, `endpoints`). Exit codes: 0 on success, 2 on a bad flag
-or an unreadable or undecodable file (reported as a Go panic).
+```text
+HTTP POST /api/users display=/api/users framework=net/http request_params=[1] handler=(*example.com/httpapi/stdapi.Server).createUser
+```
+
+Exit codes: 0 on success, 2 on a bad flag or an unreadable or undecodable
+file (reported as a Go panic).
 
 ## cgfstat
 
