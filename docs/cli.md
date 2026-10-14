@@ -11,7 +11,11 @@ pc-fe build <module-dir> [flags]
 ```
 
 Takes exactly one argument, the directory of a Go module (the one holding
-`go.mod`). There is no config file.
+`go.mod`); a directory that does not exist, or is not in a Go module, is an
+error. There is no config file. `pc-fe --version` (or `-version`, as in
+`cgfdump` and `cgfstat`) prints the version and
+the Go toolchain it was built with, e.g. `pc-fe v0.2.0 (go1.25.1)`
+(`(devel)` for a local build).
 
 ### Output
 
@@ -20,7 +24,10 @@ contract, named after the package path with `/`, `\` and `:` replaced by `_`
 (`example.com_backend_app.pb`). Each file is a deterministic binary
 `CgfPackage` message from [proto/cgf.proto](../proto/cgf.proto) with
 `language = "go"` and `schema_version = 2`. `commit_sha` is the `HEAD` of the
-git repository containing the module, or empty outside git.
+git repository containing the module, or empty outside git. `Span.file` is
+relative to the directory given to `pc-fe build`, with `/` separators, so the
+same checkout gives the same CGF wherever it sits on disk; a file outside that
+directory keeps its absolute path.
 
 The output directory is created if needed but never emptied. Files from an
 earlier run whose package no longer exists remain, and the core loads every
@@ -123,7 +130,8 @@ of the cgstore key. See [extraction.md](extraction.md#http-routes).
 | code | when |
 |---|---|
 | 0 | success, including a run with no contracts when `--require-contracts` is not set, and a failed cgstore write |
-| 1 | any error: wrong argument count, invalid flag value, `--mode mr` without `--base`/`--head`, load failure or a load guard (toolchain skew, most packages failing to type-check, missing scope package), write failure, `git diff` failure |
+| 1 | any other error: invalid flag value, `--mode mr` without `--base`/`--head`, no `go.mod` in the directory or its parents, a `--scope` that matches no package, load failure or a load guard (toolchain skew, most packages failing to type-check, missing scope package), write failure, `git diff` failure |
+| 2 | usage error: unknown flag or command, missing or extra `<repo-dir>`. The message ends with a hint to run `pc-fe build --help` |
 | 3 | `--require-contracts` and no boundary was found |
 
 Errors are printed once to stderr as `error: <message>`.
@@ -146,12 +154,13 @@ cgfdump -contracts <file.pb | dir>
 Decodes one CGF file and prints each function and its call sites:
 
 ```text
-FN (*example.com/backend/app.Implementation).GetAccount iid=6fc27fbafc52 src_params=[1] binds=1
+FN (*example.com/backend/app.Implementation).GetAccount iid=6fc27fbafc52 src_params=[1] binds=1 at=app/app.go:19
   cs=0 kind=STATIC callee=(*example.com/backend/store.Storage).FindAccountByNumber n=1 opaque=false conf=1.0000 argc=2 iids=[ 1f166ff79d11]
 ```
 
 `iid` is truncated to 12 hex digits, `src_params` are the untrusted
-parameter indices, `binds` counts the contracts the function implements. A
+parameter indices, `binds` counts the contracts the function implements and
+`at` is the function's source position. A
 synthetic HTTP client site ends in `http="<METHOD>" <path>`.
 
 | flag | default | meaning |
@@ -164,8 +173,9 @@ synthetic HTTP client site ends in `http="<METHOD>" <path>`.
 HTTP POST /api/users display=/api/users framework=net/http request_params=[1] handler=(*example.com/httpapi/stdapi.Server).createUser
 ```
 
-Exit codes: 0 on success, 2 on a bad flag or an unreadable or undecodable
-file (reported as a Go panic).
+`-version` prints the version. `-h` or `--help` prints the usage and exits 0.
+Exit codes: 0 on success, 2 on a bad flag, with no file argument, or on an
+unreadable or undecodable file (the latter reported as a Go panic).
 
 ## cgfstat
 
@@ -183,7 +193,8 @@ out/cgf/backend: shards=3 fns=23 sites=19 opaque=2
     1.0000 → 19
 ```
 
-No flags. Exit codes: 0 on success, 1 on an unreadable or undecodable file,
+`-version` prints the version and `-h` or `--help` the usage. Exit codes: 0
+on success, 1 on an unreadable or undecodable file,
 2 with no arguments. A directory with no `.pb` files (or one that does not
 exist) prints zero counts and exits 0.
 

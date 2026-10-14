@@ -35,6 +35,7 @@ import (
 	"github.com/panoptiorg/panoptife-go/internal/frameworks"
 	"github.com/panoptiorg/panoptife-go/internal/hash"
 	"github.com/panoptiorg/panoptife-go/internal/pkgclass"
+	"github.com/panoptiorg/panoptife-go/internal/relpath"
 )
 
 // Callee describes the target(s) of one call site so emit can resolve iids.
@@ -107,6 +108,9 @@ type Dispatcher interface {
 // FALSE value reproduces the previous emission byte-for-byte, so a corpus A/B
 // is attributable to exactly one change.
 type Opts struct {
+	// Paths makes span file names relative to the extracted directory. Nil
+	// leaves them as go/token reports them (absolute).
+	Paths *relpath.Rel
 	// FieldPaths: k=2 field-path facts (doc 20 §2).
 	FieldPaths bool
 	// ClosureFlow: closure free-variable slots + MakeClosure binding sites (W1d).
@@ -1495,7 +1499,7 @@ func (b *builder) posSpan(pos token.Pos) *pb.Span {
 		return nil
 	}
 	p := b.fn.Prog.Fset.Position(pos)
-	return &pb.Span{File: p.Filename, Line: int32(p.Line), Col: int32(p.Column)}
+	return &pb.Span{File: b.opts.Paths.File(p.Filename), Line: int32(p.Line), Col: int32(p.Column)}
 }
 
 // errorIface is the `error` interface itself — the target of the Implements test

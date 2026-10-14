@@ -1,6 +1,8 @@
 package loader
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -91,5 +93,26 @@ func TestIsMockPackage(t *testing.T) {
 		if got := isMockPackage(p, nil); got != c.want {
 			t.Errorf("isMockPackage(%s name=%s files=%v) = %v, want %v", c.pkgPath, c.name, c.files, got, c.want)
 		}
+	}
+}
+
+func TestCheckModule(t *testing.T) {
+	err := checkModule(t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "no go.mod in") {
+		t.Fatalf("empty dir: err = %v, want a no go.mod error", err)
+	}
+	if err := checkModule("testdata"); err != nil {
+		t.Fatalf("dir inside a module: %v", err)
+	}
+	missing := filepath.Join(t.TempDir(), "nope")
+	if err := checkModule(missing); err == nil || err.Error() != "repo not found: "+missing {
+		t.Fatalf("missing dir: err = %v, want repo not found", err)
+	}
+	file := filepath.Join(t.TempDir(), "go.mod")
+	if err := os.WriteFile(file, []byte("module m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkModule(file); err == nil || err.Error() != "not a directory: "+file {
+		t.Fatalf("file: err = %v, want not a directory", err)
 	}
 }

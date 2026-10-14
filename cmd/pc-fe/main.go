@@ -9,10 +9,19 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/panoptiorg/panoptife-go/internal/buildinfo"
 	"github.com/panoptiorg/panoptife-go/internal/emit"
 	"github.com/panoptiorg/panoptife-go/internal/pkgclass"
 	"github.com/spf13/cobra"
 )
+
+// usageError marks a mistake in the command line (exit 2), as opposed to a
+// failed extraction (exit 1).
+type usageError struct{ msg, cmd string }
+
+func (e *usageError) Error() string {
+	return e.msg + "\nRun '" + e.cmd + " --help' for usage."
+}
 
 func main() {
 	var (
@@ -56,12 +65,33 @@ func main() {
 		// non-nil RunE return; without this the error was printed a SECOND time
 		// below, so a --require-contracts CI failure showed the same line twice.
 		SilenceErrors: true,
+		SilenceUsage:  true,
+		Version:       "version",
+		Args:          cobra.ArbitraryArgs,
+		RunE: func(c *cobra.Command, args []string) error {
+			if len(args) > 0 {
+				return &usageError{fmt.Sprintf("unknown command %q", args[0]), c.CommandPath()}
+			}
+			return c.Help()
+		},
 	}
+	root.SetVersionTemplate(buildinfo.Version("pc-fe") + "\n")
+	root.SetFlagErrorFunc(func(c *cobra.Command, err error) error {
+		return &usageError{err.Error(), c.CommandPath()}
+	})
 
 	buildCmd := &cobra.Command{
-		Use:   "build [repo-dir]",
+		Use:   "build <repo-dir>",
 		Short: "Extract CGF for a Go repo (module dir)",
-		Args:  cobra.ExactArgs(1),
+		Args: func(c *cobra.Command, args []string) error {
+			switch {
+			case len(args) == 0:
+				return &usageError{"missing <repo-dir>: the directory of the Go module to extract", c.CommandPath()}
+			case len(args) > 1:
+				return &usageError{fmt.Sprintf("expected one <repo-dir>, got %d arguments", len(args)), c.CommandPath()}
+			}
+			return nil
+		},
 		// A failed extraction is not a usage error: dumping the flag list
 		// would bury the diagnostic that explains it (see noContractsHint).
 		SilenceUsage: true,
@@ -148,10 +178,18 @@ func main() {
 
 	root.AddCommand(buildCmd)
 
+	// cgfdump and cgfstat take Go's single-dash -version; so does pc-fe.
+	if len(os.Args) == 2 && os.Args[1] == "-version" {
+		os.Args[1] = "--version"
+	}
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		if errors.Is(err, emit.ErrNoContracts) {
 			os.Exit(3) // --require-contracts: distinct from a real failure
+		}
+		var ue *usageError
+		if errors.As(err, &ue) {
+			os.Exit(2)
 		}
 		os.Exit(1)
 	}

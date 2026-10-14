@@ -4,6 +4,8 @@
 // Phase 0).
 //
 // usage: cgfstat <cgf-dir> [<cgf-dir>...]
+//
+//	cgfstat -version
 package main
 
 import (
@@ -14,13 +16,24 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/panoptiorg/panoptife-go/internal/buildinfo"
 	"github.com/panoptiorg/panoptife-go/internal/cgfpb"
 )
 
+const usage = "usage: cgfstat <cgf-dir> [<cgf-dir>...]\n       cgfstat -version"
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: cgfstat <cgf-dir> [<cgf-dir>...]")
+		fmt.Fprintln(os.Stderr, usage)
 		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "-h", "--help", "-help":
+		fmt.Println(usage)
+		return
+	case "-version", "--version":
+		fmt.Println(buildinfo.Version("cgfstat"))
+		return
 	}
 	for _, dir := range os.Args[1:] {
 		if err := run(dir); err != nil {

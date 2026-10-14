@@ -63,8 +63,9 @@ func buildManifest(o Options, byPkg map[string]*pb.CgfPackage) (*Manifest, error
 		changed[f] = true
 	}
 
-	// fset filenames are absolute (and macOS /tmp is a /private/tmp symlink);
-	// normalize both sides before Rel.
+	// Spans are relative to the repo dir already; one that is still absolute
+	// lies outside it or was not relativized. Such names are absolute (and
+	// macOS /tmp is a /private/tmp symlink): normalize both sides before Rel.
 	root, err := filepath.Abs(o.RepoDir)
 	if err != nil {
 		return nil, err
@@ -74,6 +75,9 @@ func buildManifest(o Options, byPkg map[string]*pb.CgfPackage) (*Manifest, error
 	}
 	relCache := map[string]string{}
 	relOf := func(abs string) string {
+		if !filepath.IsAbs(abs) {
+			return abs
+		}
 		if r, ok := relCache[abs]; ok {
 			return r
 		}
