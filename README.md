@@ -23,7 +23,6 @@ twmb/franz-go. The details and limits are in
 [How extraction works](docs/extraction.md).
 
 **Overview, diagrams and live examples: [panopti.org](https://panopti.org)**
-· **Using it on your system: [the user guide](https://panopti.org/guide/)**
 
 ## Install
 
