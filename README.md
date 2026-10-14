@@ -31,7 +31,7 @@ it with the same Go you will run it with:
 
 <!-- x-release-please-start-version -->
 ```bash
-go install github.com/panoptiorg/panoptife-go/cmd/...@v0.2.0   # pc-fe, cgfdump, cgfstat
+go install github.com/panoptiorg/panoptife-go/cmd/...@v0.3.0   # pc-fe, cgfdump, cgfstat
 ```
 
 Each [release](https://github.com/panoptiorg/panoptife-go/releases) also has a
@@ -40,8 +40,8 @@ tarball per platform (linux and darwin, amd64 and arm64) with `pc-fe`,
 
 ```bash
 platform=darwin_arm64   # or darwin_amd64, linux_amd64, linux_arm64
-base=https://github.com/panoptiorg/panoptife-go/releases/download/v0.2.0
-file=panoptife-go_0.2.0_$platform.tar.gz
+base=https://github.com/panoptiorg/panoptife-go/releases/download/v0.3.0
+file=panoptife-go_0.3.0_$platform.tar.gz
 curl -fLO $base/$file -O $base/SHA256SUMS
 shasum -a 256 -c --ignore-missing SHA256SUMS
 tar -xzf $file
