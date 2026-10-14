@@ -1,6 +1,8 @@
 package loader
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -101,5 +103,16 @@ func TestCheckModule(t *testing.T) {
 	}
 	if err := checkModule("testdata"); err != nil {
 		t.Fatalf("dir inside a module: %v", err)
+	}
+	missing := filepath.Join(t.TempDir(), "nope")
+	if err := checkModule(missing); err == nil || err.Error() != "repo not found: "+missing {
+		t.Fatalf("missing dir: err = %v, want repo not found", err)
+	}
+	file := filepath.Join(t.TempDir(), "go.mod")
+	if err := os.WriteFile(file, []byte("module m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkModule(file); err == nil || err.Error() != "not a directory: "+file {
+		t.Fatalf("file: err = %v, want not a directory", err)
 	}
 }

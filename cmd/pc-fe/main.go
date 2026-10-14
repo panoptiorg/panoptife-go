@@ -178,6 +178,10 @@ func main() {
 
 	root.AddCommand(buildCmd)
 
+	// cgfdump and cgfstat take Go's single-dash -version; so does pc-fe.
+	if len(os.Args) == 2 && os.Args[1] == "-version" {
+		os.Args[1] = "--version"
+	}
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		if errors.Is(err, emit.ErrNoContracts) {

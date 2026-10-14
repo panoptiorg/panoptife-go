@@ -11,7 +11,9 @@ pc-fe build <module-dir> [flags]
 ```
 
 Takes exactly one argument, the directory of a Go module (the one holding
-`go.mod`). There is no config file. `pc-fe --version` prints the version and
+`go.mod`); a directory that does not exist, or is not in a Go module, is an
+error. There is no config file. `pc-fe --version` (or `-version`, as in
+`cgfdump` and `cgfstat`) prints the version and
 the Go toolchain it was built with, e.g. `pc-fe v0.2.0 (go1.25.1)`
 (`(devel)` for a local build).
 

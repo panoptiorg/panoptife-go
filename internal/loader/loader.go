@@ -5,7 +5,9 @@
 package loader
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"runtime"
@@ -200,10 +202,18 @@ func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, 
 	}, nil
 }
 
-// checkModule fails when dir is not inside a Go module. `go env GOMOD` prints
-// an empty line, or the null device on Windows, outside one. If the go command
-// cannot be run at all the check is skipped and packages.Load reports it.
+// checkModule fails when dir does not exist, is not a directory, or is not
+// inside a Go module. `go env GOMOD` prints an empty line, or the null device
+// on Windows, outside one. If the go command cannot be run at all the module
+// check is skipped and packages.Load reports it.
 func checkModule(dir string) error {
+	fi, err := os.Stat(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("repo not found: %s", dir)
+	}
+	if err == nil && !fi.IsDir() {
+		return fmt.Errorf("not a directory: %s", dir)
+	}
 	cmd := exec.Command("go", "env", "GOMOD")
 	cmd.Dir = dir
 	out, err := cmd.Output()
