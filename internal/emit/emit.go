@@ -30,6 +30,7 @@ import (
 	"github.com/panoptiorg/panoptife-go/internal/httproute"
 	"github.com/panoptiorg/panoptife-go/internal/loader"
 	"github.com/panoptiorg/panoptife-go/internal/pkgclass"
+	"github.com/panoptiorg/panoptife-go/internal/relpath"
 	"github.com/panoptiorg/panoptife-go/internal/satisfaction"
 )
 
@@ -304,6 +305,7 @@ func Run(o Options) error {
 	var caps []callerCap
 	fnByIID := map[string]*pb.Function{}
 	fo := o.flowOpts()
+	fo.Paths = relpath.New(o.RepoDir)
 	fo.Emittable = emittable
 	fo.RemoteClients = flow.BuildRemoteClientIndex(ld.Prog, o.PbPaths)
 	if fo.TopicCells {
@@ -862,7 +864,7 @@ func buildFunction(repo string, disp flow.Dispatcher, fn *ssa.Function, iidOf ma
 		Generated: generatorOf(file) != pb.Generator_GEN_NONE,
 		Generator: generatorOf(file),
 		HasBody:   true,
-		Span:      spanOf(fn),
+		Span:      spanOf(fn, fo.Paths),
 		Signature: signatureOf(fn),
 		Flow:      res.Flow,
 	}, ce, sc
@@ -1083,12 +1085,12 @@ func isByRef(typ string) bool {
 	return strings.HasPrefix(typ, "*") || strings.HasPrefix(typ, "[]") || strings.HasPrefix(typ, "map[")
 }
 
-func spanOf(fn *ssa.Function) *pb.Span {
+func spanOf(fn *ssa.Function, paths *relpath.Rel) *pb.Span {
 	if fn.Prog == nil || !fn.Pos().IsValid() {
 		return nil
 	}
 	p := fn.Prog.Fset.Position(fn.Pos())
-	return &pb.Span{File: p.Filename, Line: int32(p.Line), Col: int32(p.Column)}
+	return &pb.Span{File: paths.File(p.Filename), Line: int32(p.Line), Col: int32(p.Column)}
 }
 
 func inScopeSet(pkgs []*ssa.Package) map[*ssa.Package]bool {

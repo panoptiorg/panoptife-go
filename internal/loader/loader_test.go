@@ -93,3 +93,13 @@ func TestIsMockPackage(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckModule(t *testing.T) {
+	err := checkModule(t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "no go.mod in") {
+		t.Fatalf("empty dir: err = %v, want a no go.mod error", err)
+	}
+	if err := checkModule("testdata"); err != nil {
+		t.Fatalf("dir inside a module: %v", err)
+	}
+}

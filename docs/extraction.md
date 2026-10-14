@@ -18,6 +18,7 @@ packages and all their dependencies (type-checked from source), and
 `Tests: false`, so `_test.go` files are never loaded. Type errors in individual packages are
 tolerated. The run fails instead of emitting a near-empty CGF when:
 
+- the directory is not inside a Go module (`go env GOMOD` is empty);
 - any package reports `requires newer Go version` (the toolchain `pc-fe` was
   built with is older than the module's `go` directive; rebuild it with a
   newer one);
@@ -420,7 +421,9 @@ every fixture; see [CONTRIBUTING.md](../CONTRIBUTING.md).
 ## 7. Output
 
 One file per package with emitted functions or contracts, written to `--out`
-(see [cli.md](cli.md#output)). With `--require-contracts` and nothing found,
+(see [cli.md](cli.md#output)). `Span.file` is relative to the directory
+`pc-fe` was run on, with symlinks resolved on both sides, so `/tmp` and
+`/private/tmp` agree; spans are not part of any `iid` or `bid`. With `--require-contracts` and nothing found,
 the files are written first and the run then exits 3. The cgstore snapshot and
 the `mr` manifest are written after the CGF.
 
@@ -453,6 +456,7 @@ Printed when they apply:
 
 | prefix | meaning |
 |---|---|
+| `load-warn: N of M packages have type errors and are left out of the CGF` | those packages are not in the CGF at all (a run where most packages fail stops instead); `--verbose` prints the errors |
 | `emit-warn: dangling callee iid` | a call target is not in the emitted set; the core will treat it as a library call |
 | `emit-warn: ... Unimplemented<Svc>Server but 0 gRPC handlers` | the server type exists but its handlers are outside `--scope` |
 | `contracts-warn:` | the generated `<Svc>Server` interface was not found; handlers were matched by shape |
@@ -542,7 +546,7 @@ fallbacks on purpose.
 | `kafka/producer`, `kafka/consumer` | a kafka-go writer and a sarama consumer group joined by topic `orders`, a decoy pair `audit-events` / `audit-log` that must not join; also sarama's async `Input()`, franz-go `DefaultProduceTopic` and `ConsumeTopics`, a kafka-go reader, an `os.Getenv` topic and a parameter topic |
 
 `federation`, `backend` and `downstream`, with panoptife-ts's `webapp`, form
-the example system; [The example system](https://github.com/panoptiorg/panopticode/blob/master/docs/example.md)
+the example system; [The example system](https://github.com/panoptiorg/panopticode/blob/main/docs/example.md)
 maps their code to the 18 findings they produce.
 
 [core]: https://github.com/panoptiorg/panopticode

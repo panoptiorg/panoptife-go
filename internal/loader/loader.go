@@ -57,6 +57,9 @@ type Loaded struct {
 // "mock,mocks"); mockgen's own output naming (`mock_` prefix, `_mock.go` /
 // `zzz_` files) is not configurable.
 func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, mockPaths pkgclass.MockPaths) (*Loaded, error) {
+	if err := checkModule(repoDir); err != nil {
+		return nil, err
+	}
 	patterns := splitScope(scope)
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
@@ -135,6 +138,9 @@ func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, 
 	// Loud-fail guards (doc 16 §3.7): extraction that would be near-empty is a
 	// correctness failure, not a tolerable degradation.
 	if len(init) == 0 {
+		if pat := unmatchedPattern(pkgs); pat != "" {
+			return nil, fmt.Errorf("scope %q matched no packages in %s", pat, repoDir)
+		}
 		return nil, fmt.Errorf("scope %q matched %d packages but none type-checked/built (%d type errors); refusing to emit an empty CGF — run with --verbose for the errors", scope, len(pkgs), nErr)
 	}
 	if nBadRoots*2 > len(pkgs) {
@@ -153,6 +159,19 @@ func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, 
 				"usually an unresolvable dependency or an incomplete module cache (try --verbose, "+
 				"or --allow-missing-scope to extract anyway, knowing every number is then a floor)",
 			len(missing), len(patterns), strings.Join(firstN(missing, 5), ", "))
+	}
+	// A package with type errors gets no SSA package, so it is left out of the
+	// CGF. The guards above tolerate a minority of them; say so even without
+	// --verbose, or a wildcard scope loses packages without a word.
+	var left []string
+	for i, sp := range ssaPkgs {
+		if sp == nil && i < len(pkgs) && len(pkgs[i].Errors) > 0 {
+			left = append(left, pkgs[i].PkgPath)
+		}
+	}
+	if len(left) > 0 {
+		fmt.Fprintf(os.Stderr, "load-warn: %d of %d packages have type errors and are left out of the CGF (e.g. %s); run with --verbose for the errors\n",
+			len(left), len(pkgs), strings.Join(firstN(left, 3), ", "))
 	}
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
@@ -179,6 +198,49 @@ func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, 
 		TBuild:        tBuild,
 		NMocks:        nMocks,
 	}, nil
+}
+
+// checkModule fails when dir is not inside a Go module. `go env GOMOD` prints
+// an empty line, or the null device on Windows, outside one. If the go command
+// cannot be run at all the check is skipped and packages.Load reports it.
+func checkModule(dir string) error {
+	cmd := exec.Command("go", "env", "GOMOD")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	if m := strings.TrimSpace(string(out)); m == "" || m == os.DevNull || m == "NUL" {
+		return fmt.Errorf("no go.mod in %s or its parents: pc-fe reads Go modules (for TypeScript, use pc-fe-ts)", dir)
+	}
+	return nil
+}
+
+// unmatchedPattern returns the first --scope pattern that go list reported as
+// matching nothing (a missing directory or an empty wildcard), but only when
+// every returned entry is such a report. These entries carry the pattern as
+// their ID and a list error with no position; any other failure, such as an
+// unresolvable import, keeps the generic message.
+func unmatchedPattern(pkgs []*packages.Package) string {
+	first := ""
+	for _, p := range pkgs {
+		if len(p.GoFiles) > 0 || len(p.Errors) != 1 {
+			return ""
+		}
+		e := p.Errors[0]
+		if e.Kind != packages.ListError || e.Pos != "-" && e.Pos != "" {
+			return ""
+		}
+		m := e.Msg
+		if !strings.Contains(m, "directory not found") && !strings.Contains(m, "no such file or directory") &&
+			!strings.Contains(m, "matched no packages") && !strings.Contains(m, "does not contain main module") {
+			return ""
+		}
+		if first == "" {
+			first = p.ID
+		}
+	}
+	return first
 }
 
 // BuildCallGraph resolves interface/dynamic dispatch over the built SSA. VTA

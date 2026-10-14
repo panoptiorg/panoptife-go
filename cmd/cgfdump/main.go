@@ -15,6 +15,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/panoptiorg/panoptife-go/internal/buildinfo"
 	"github.com/panoptiorg/panoptife-go/internal/cgfpb"
 )
 
@@ -22,7 +23,20 @@ func main() {
 	flowFn := flag.String("flow", "", "also print LocalFlow for functions whose fqn contains this")
 	sites := flag.Bool("sites", false, "TSV per call site: fqn, cs, opaque, conf, sorted callee iids (arg may be a CGF dir)")
 	contracts := flag.Bool("contracts", false, "list endpoints, gRPC methods, GraphQL fields and HTTP routes instead (arg may be a CGF dir)")
+	version := flag.Bool("version", false, "print the version and exit")
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: cgfdump [-flow <substring>] <file.pb>\n       cgfdump -sites <file.pb | dir>\n       cgfdump -contracts <file.pb | dir>\n       cgfdump -version")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
+	if *version {
+		fmt.Println(buildinfo.Version("cgfdump"))
+		return
+	}
+	if flag.NArg() == 0 {
+		flag.Usage()
+		os.Exit(2)
+	}
 	arg := flag.Arg(0)
 	if *contracts {
 		paths := []string{arg}
@@ -53,7 +67,11 @@ func main() {
 		panic(err)
 	}
 	for _, f := range cp.Functions {
-		fmt.Printf("FN %s iid=%x src_params=%v binds=%d\n", f.Fqn, f.Id.Iid[:6], f.SourceParams, len(f.BindsTo))
+		at := ""
+		if sp := f.Span; sp != nil {
+			at = fmt.Sprintf(" at=%s:%d", sp.File, sp.Line)
+		}
+		fmt.Printf("FN %s iid=%x src_params=%v binds=%d%s\n", f.Fqn, f.Id.Iid[:6], f.SourceParams, len(f.BindsTo), at)
 		if f.Flow == nil {
 			continue
 		}
