@@ -23,10 +23,44 @@ twmb/franz-go. The details and limits are in
 [How extraction works](docs/extraction.md).
 
 **Overview, diagrams and live examples: [panopti.org](https://panopti.org)**
+· **Using it on your system: [the user guide](https://panopti.org/guide/)**
+
+## Install
+
+`pc-fe` loads packages through the `go` command, so you need Go anyway. Build
+it with the same Go you will run it with:
+
+<!-- x-release-please-start-version -->
+```bash
+go install github.com/panoptiorg/panoptife-go/cmd/...@v0.2.0   # pc-fe, cgfdump, cgfstat
+```
+
+Each [release](https://github.com/panoptiorg/panoptife-go/releases) also has a
+tarball per platform (linux and darwin, amd64 and arm64) with `pc-fe`,
+`cgfdump` and `cgfstat`, and a `SHA256SUMS` file:
+
+```bash
+platform=darwin_arm64   # or darwin_amd64, linux_amd64, linux_arm64
+base=https://github.com/panoptiorg/panoptife-go/releases/download/v0.2.0
+file=panoptife-go_0.2.0_$platform.tar.gz
+curl -fLO $base/$file -O $base/SHA256SUMS
+shasum -a 256 -c --ignore-missing SHA256SUMS
+tar -xzf $file
+```
+<!-- x-release-please-end -->
+
+At run time `pc-fe` needs:
+
+- a Go toolchain on `PATH` that is at least as new as the `go` line of the
+  module you extract, and no newer than the Go `pc-fe` was built with
+  (`pc-fe --version` shows it). A newer one fails with `toolchain skew`:
+  rebuild `pc-fe` with `go install`;
+- the module's dependencies, downloadable or already in the module cache
+  (for private modules set `GOPROXY` and `GOPRIVATE` as for `go build`).
 
 ## Quickstart
 
-You need Go 1.25 or newer, and no older than the target module's `go` line.
+Building from a checkout needs Go 1.25 or newer.
 `fixtures/` holds small services that call each other. Three of them form
 the example below: a GraphQL resolver in `federation` calls `backend` over
 gRPC, and `backend` calls `downstream`, which runs SQL.

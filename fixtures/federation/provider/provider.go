@@ -1,5 +1,5 @@
-// Package provider mirrors the standard Go mockability idiom that FN-01
-// (measurements 2026-09-01) found defeating gRPC client detection: a local,
+// Package provider mirrors the standard Go mockability idiom that defeats
+// name-based gRPC client detection: a local,
 // narrow `Client` interface declared over the generated pb client and injected
 // with the real one. The interface is named exactly `Client` and lives outside
 // any pb/api package — both conditions the name-convention detector refuses —
