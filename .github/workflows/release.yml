@@ -59,9 +59,11 @@ jobs:
         with:
           ref: ${{ env.TAG }}
 
+      # The newest stable Go, not go.mod's: pc-fe type-checks the target's
+      # standard library, which must not be newer than the Go it was built with.
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: stable
           cache: false
 
       - name: build
