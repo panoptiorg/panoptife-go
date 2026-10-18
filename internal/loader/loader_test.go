@@ -96,7 +96,7 @@ func TestIsMockPackage(t *testing.T) {
 	}
 	for _, c := range cases {
 		p := &packages.Package{PkgPath: c.pkgPath, Name: c.name, GoFiles: c.files}
-		if got := isMockPackage(p, nil); got != c.want {
+		if got := isMockPackage(p, nil, nil); got != c.want {
 			t.Errorf("isMockPackage(%s name=%s files=%v) = %v, want %v", c.pkgPath, c.name, c.files, got, c.want)
 		}
 	}
@@ -290,5 +290,85 @@ func TestCallGraphPanicIsReported(t *testing.T) {
 	ld.vtaFuncs = nil
 	if cg, _, err := ld.CallGraph("vta"); err != nil || cg == nil {
 		t.Errorf("CallGraph = (%v, %v), want a graph", cg, err)
+	}
+}
+
+// A package is a mock package when every non-test file is a mock file, and a
+// file counts as a mock by its name or by a generator header.
+func TestIsMockPackageByHeader(t *testing.T) {
+	headers := map[string]bool{"/x/doubles.go": true, "/x/more.go": true}
+	cases := []struct {
+		files []string
+		want  bool
+	}{
+		{[]string{"/x/doubles.go"}, true},
+		{[]string{"/x/doubles.go", "/x/more.go"}, true},
+		{[]string{"/x/doubles.go", "/x/zzz_b.go", "/x/a_test.go"}, true},
+		{[]string{"/x/doubles.go", "/x/real.go"}, false}, // one real file keeps the package
+		{[]string{"/x/real.go"}, false},
+	}
+	for _, c := range cases {
+		p := &packages.Package{PkgPath: "example.com/storetest", Name: "storetest", GoFiles: c.files}
+		if got := isMockPackage(p, nil, headers); got != c.want {
+			t.Errorf("isMockPackage(files=%v) = %v, want %v", c.files, got, c.want)
+		}
+	}
+}
+
+// testdata/mockfiles: `store` is real code with one mockgen file, `storetest`
+// holds only mockgen output, `mockingbird` is real code with a mock-like name,
+// and `app` mentions mockgen only in comments below its package clause.
+func TestLoadFindsMocksByHeader(t *testing.T) {
+	const mod = "example.com/mockfiles/"
+	ld, err := Load("testdata/mockfiles", "./...", false, true, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	built := map[string]bool{}
+	for _, sp := range ld.InitPkgs {
+		built[sp.Pkg.Path()] = true
+	}
+	for _, want := range []string{"store", "mockingbird", "app"} {
+		if !built[mod+want] {
+			t.Errorf("%s must be built, built=%v", want, built)
+		}
+	}
+	if built[mod+"storetest"] || ld.NMocks != 1 {
+		t.Errorf("storetest has only mock files and must be dropped (built=%v, NMocks=%d)", built, ld.NMocks)
+	}
+	abs := func(p string) string {
+		a, err := filepath.Abs(filepath.Join("testdata/mockfiles", p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	for file, want := range map[string]bool{
+		"store/fake.go":           true,  // header in a real package
+		"store/store.go":          false, // real file beside it
+		"store/zzz_gen.go":        true,  // name rule, no header
+		"storetest/doubles.go":    true,
+		"mockingbird/bird.go":     false,
+		"app/app.go":              false,
+		"app/doc.go":              false, // comments name mockgen, no header
+		"store/ledger.pb.go":      false, // other generator
+		"store/not-a-file-at-all": false,
+	} {
+		if got := ld.IsMockFile(abs(file)); got != want {
+			t.Errorf("IsMockFile(%s) = %v, want %v", file, got, want)
+		}
+	}
+}
+
+// The mock-file set covers dependency packages, not only the roots, so a
+// caller can classify a dispatch target that lives in a dependency.
+func TestIsMockFileCoversDependencies(t *testing.T) {
+	ld, err := Load("testdata/mockfiles", "example.com/mockfiles/app", false, true, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake, _ := filepath.Abs("testdata/mockfiles/store/fake.go")
+	if !ld.IsMockFile(fake) {
+		t.Error("store/fake.go is a dependency of the scope and must be found as a mock file")
 	}
 }

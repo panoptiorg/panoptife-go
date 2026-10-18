@@ -114,8 +114,8 @@ type Options struct {
 	PbPaths pkgclass.PbPaths
 	// MockPaths is the mockgen directory heuristic (--mock-paths); the zero
 	// value is `mock,mocks`. Only the path SEGMENTS are configurable — the
-	// `mock_` package prefix and the `_mock.go` / `zzz_` file names are
-	// mockgen's own output naming and stay fixed.
+	// `mock_` package prefix, the `_mock.go` / `zzz_` file names and the
+	// generator headers are mockgen's own output and stay fixed.
 	MockPaths pkgclass.MockPaths
 	// RequireContracts turns the "no contracts and no remote calls" warning
 	// into exit code 3 (assessment §4/§9: the monoculture failure mode is a
@@ -250,13 +250,13 @@ func Run(o Options) error {
 			return false
 		}
 		if fn.Pkg != nil {
-			return inScope[fn.Pkg] && !excludedFile(fileOf(fn))
+			return inScope[fn.Pkg] && !excludedFile(fileOf(fn), ld.IsMockFile)
 		}
 		if len(fn.TypeArgs()) == 0 && fn.Synthetic == "" {
 			return false // package-less, neither an instance nor a wrapper
 		}
 		sp := declaringScopePkg(fn)
-		return sp != nil && inScope[sp] && !excludedFile(fileOf(fn))
+		return sp != nil && inScope[sp] && !excludedFile(fileOf(fn), ld.IsMockFile)
 	}
 	// Collect emittable functions: user code, has body, not test/mock — now
 	// including generic instantiations. droppedGeneric counts the residual gap:
@@ -318,7 +318,7 @@ func Run(o Options) error {
 	// Functions that dependency modules declare: dispatch may name them, and a
 	// call to one links to the summary in that module's own CGF.
 	ext := callgraph.NewExternals(ld.Prog, owner, ld.DepPackages(), func(fn *ssa.Function) bool {
-		return excludedFile(fileOf(fn))
+		return excludedFile(fileOf(fn), ld.IsMockFile)
 	}, !o.NoDepImpls)
 	// Building dependency bodies can create instances of in-scope generic
 	// functions that the collection above never saw. Only functions collected
@@ -376,7 +376,7 @@ func Run(o Options) error {
 	nRemoteSites := 0
 	var sc siteCensus
 	for _, fn := range fns {
-		f, ce, fnSC := buildFunction(owner, ext, disp, fn, iidOf, capturing, fo)
+		f, ce, fnSC := buildFunction(owner, ext, disp, fn, iidOf, capturing, fo, ld.IsMockFile)
 		if f.Flow != nil {
 			for _, cs := range f.Flow.Callsites {
 				if cs.Kind == pb.CallSite_INVOKES_REMOTE {
@@ -849,7 +849,7 @@ func (s *siteCensus) add(o siteCensus) {
 	s.topics.Add(o.topics)
 }
 
-func buildFunction(owner hash.Owner, ext *callgraph.Externals, disp flow.Dispatcher, fn *ssa.Function, iidOf map[*ssa.Function][]byte, capture bool, fo flow.Opts) (*pb.Function, *spb.CallerEdges, siteCensus) {
+func buildFunction(owner hash.Owner, ext *callgraph.Externals, disp flow.Dispatcher, fn *ssa.Function, iidOf map[*ssa.Function][]byte, capture bool, fo flow.Opts, isMock func(string) bool) (*pb.Function, *spb.CallerEdges, siteCensus) {
 	res := flow.Build(fn, disp, fo)
 	sc := siteCensus{
 		sites:      len(res.Flow.Callsites),
@@ -964,8 +964,8 @@ func buildFunction(owner hash.Owner, ext *callgraph.Externals, disp flow.Dispatc
 		Fqn:       hash.FQN(fn),
 		Package:   hash.PackagePath(fn),
 		Origin:    originOf(hash.PackagePath(fn), owner.Repo),
-		Generated: generatorOf(file) != pb.Generator_GEN_NONE,
-		Generator: generatorOf(file),
+		Generated: generatorOf(file, isMock) != pb.Generator_GEN_NONE,
+		Generator: generatorOf(file, isMock),
 		HasBody:   true,
 		Span:      spanOf(fn, fo.Paths),
 		Signature: signatureOf(fn),
