@@ -56,6 +56,8 @@ func main() {
 		httpCalls    bool
 		topicCells   bool
 		seedRequest  bool
+		depImpls     bool
+		depBodies    bool
 	)
 
 	root := &cobra.Command{
@@ -140,6 +142,8 @@ func main() {
 				NoHTTPCalls:            !httpCalls,
 				NoTopicCells:           !topicCells,
 				HTTPSeedRequest:        seedRequest,
+				NoDepImpls:             !depImpls,
+				DepBodies:              depBodies,
 			}
 			return emit.Run(opts)
 		},
@@ -175,6 +179,9 @@ func main() {
 	buildCmd.Flags().BoolVar(&topicCells, "topic-cells", true, "Kafka produce/consume calls (kafka-go, sarama, franz-go) with a constant or os.Getenv topic (the symbol ${env:NAME}) become heap-cell writes/reads of the message payload keyed by topic, joined across repos by the core; sarama ConsumeClaim callbacks get Endpoint{MESSAGE}. false restores the previous emission")
 	buildCmd.Flags().BoolVar(&seedRequest, "http-seed-request", false, "MEASUREMENT INSTRUMENT: also add each HTTP route handler's request parameters (r, c) to source_params. Off by default because a whole-request seed taints every context.Context the request hands out. Ignored with --http-routes=false")
 	buildCmd.Flags().BoolVar(&byRefOut, "byref-out", false, "by-ref param/receiver out-slots + the caller-side arg back-edge; DEFAULT OFF — an emission change, so off must reproduce the previous CGF byte-for-byte")
+
+	buildCmd.Flags().BoolVar(&depImpls, "dep-impls", true, "an interface call that dispatch cannot resolve gets, as targets, the methods that dependency modules declare for it (1 to 10 types; none from mock packages or test files), so the call links to the summary in that module's own CGF; the call also keeps its unresolved entry, so the default leaf still applies. false restores the previous emission: such a call has no target. Targets that the call graph itself finds in a dependency stay. Rides in the cgstore key")
+	buildCmd.Flags().BoolVar(&depBodies, "dep-bodies", false, "also build the SSA bodies of dependency packages before the call graph, so VTA sees flows that run through them and finds more dependency targets. Emits the same functions. DEFAULT OFF: roughly doubles the SSA and call-graph time. Rides in the cgstore key")
 
 	root.AddCommand(buildCmd)
 

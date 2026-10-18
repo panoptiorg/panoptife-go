@@ -49,6 +49,12 @@ are included: method values (`$bound`), method expressions (`$thunk`),
 promoted methods of embedded structs, and generic instantiations. Without
 them a call through `x.Method` as a value would resolve to nothing.
 
+The declared methods of every non-generic named type of an in-scope package
+are emitted too, also when the package never converts the type to an interface.
+The call graph's reachability walk misses a method of an unexported type that
+only other modules call (a constructor that returns `*client`), and the
+calling module needs a summary under that method's iid.
+
 Generated code is kept, because generated getters and dispatchers carry data.
 Each function records its `generator` from the file name (`*.pb.go`,
 `*_grpc.pb.go`, `*_vtproto.pb.go` for protoc; `*.generated.go`,
@@ -65,11 +71,12 @@ every in-scope function at once; on a large module, narrow `--scope` or use
 `--dispatch cha`.
 
 `internal/callgraph.Resolver` then answers per call instruction. It keeps
-only targets that are themselves emitted, removes duplicates and sorts them by
+the targets that are themselves emitted, removes duplicates and sorts them by
 name so the output is stable. A site with one target gets confidence 1.0, a
 site with `n` targets gets `1/n`. A site with more than 10 targets
 (`DefaultFanoutCap`) is marked `opaque` with no targets: the core then treats
-the call as an unknown library call.
+the call as an unknown library call. Targets in dependency modules can join
+these (see below).
 
 A call through a function value with no targets is marked `opaque`; an
 interface method call with no targets is not. Either gets one callee id
@@ -77,6 +84,87 @@ hashed from its `callee_fqn`, which matches no emitted function. With
 `--dispatch off` no interface or function-value call has targets. Both
 kinds, and builtin calls, are counted as `unresolved` in the census line
 below.
+
+### Targets in dependency modules
+
+The SSA bodies of packages outside `--scope` are not built, and VTA learns a
+type only from an instruction in a built body. A library constructor such as
+`func New() Client { return &client{} }` converts its concrete type in a body
+that nobody built, so VTA sees no type behind the interface that the caller
+holds. Without more, such a call has no target.
+
+A call can still reach a function that a dependency module declares. That
+module has its own CGF, and its summary for the function sits under the iid
+that [Identity](#6-identity) gives it. A call site that names the function by
+that iid links to the summary. Three rules, applied per call site, do this:
+
+1. The emitted targets decide the cap exactly as before.
+2. A target that the call graph finds in a dependency is added when the
+   emitted and dependency targets together are at most 10. Over that number
+   the site keeps its emitted targets only, so a dependency target never makes
+   a site opaque.
+3. An interface call that has no target after rules 1 and 2, and is not over
+   the cap, and whose interface a module declares, gets the declared
+   implementations. (An interface of the standard library gets none: any
+   loaded library has some type with a matching method, unrelated to the call,
+   and the targets would change with the set of dependencies.) For every named
+   type that a
+   dependency package declares, where the type or a pointer to it implements
+   the interface, the target is the method that the interface method selects
+   on it. A method that the type gets by embedding is the embedded type's own
+   declared method. The site uses them when there are 1 to 10. With more, it
+   keeps no target, as before. `--dep-impls=false` turns this rule off.
+
+A dependency function, for these rules, is a function or method declared by
+name in a package that is out of scope, that a module declares (so not the
+standard library) and that is not a mock package, in a file that is not a test
+or mock file. Closures and generic instances do not count. A wrapper that the
+call graph names as the target (a promoted method, a pointer-receiver wrapper,
+or a bound method) is replaced by the declared method it wraps; if there is
+none, the target is dropped. A method-expression thunk (`lib.Base.Tag` used as
+a value) is dropped too: it takes the receiver as its first parameter, so a
+call through it passes one argument more than the method has, and naming the
+method would shift every argument by one slot in the core. A call on a
+generated gRPC client or stream is recognised before dispatch (see
+[Contracts and remote calls](#5-contracts-and-remote-calls)), as before.
+
+Each such target is written as the iid its own module gives it, is not counted
+as `dangling`, and its fqn is in the site's `target_fqns` (same order as
+`callee_iids`), so a reader can name it without that module's CGF.
+`target_fqns` is set on every site whose `callee_iids` are dispatch targets,
+and is not part of the `bid`.
+
+The targets can never be all the code that runs at an interface call: types of
+the standard library, mocks and unbuilt code are left out. So a site with at
+least one dependency target also keeps the entry that a site without targets
+has, the iid hashed from `callee_fqn`, as its last `callee_iids` entry, and
+`callee_fqn` as the last `target_fqns` entry. `dispatch_confidence` is 1 over
+the number of entries. The core then composes the summaries it finds and also
+applies the default leaf. A site with emitted targets only is unchanged. The
+cgstore keeps the targets only; a replay adds the entry again.
+
+`--dep-bodies` builds the SSA bodies of the dependency packages before the call
+graph. VTA then sees the flows inside them, and the same rules give a more
+exact answer: a library constructor that returns one of two implementations
+yields that one and not both. It does not change which functions are emitted,
+and it costs about twice the SSA and call-graph time, so it is off by default.
+It acts with `--dispatch vta` only; CHA does not read bodies.
+
+VTA then runs over the functions that exist before the dependency bodies are
+built, plus the dependencies' package members, declared methods and nested
+anonymous functions. (`ssautil.AllFunctions` panics on some dependency bodies
+in the pinned x/tools, so it is not called after the build.) The bodies also
+reach emission: a getter of a generated message in a dependency is read as a
+plain field read once its body is built, as for a getter of the module, so its
+call site goes away. The bodies are built before a cgstore snapshot is tried
+as well, so that a replay sees the same call sites.
+
+If the call-graph builder panics, `pc-fe` prints `dispatch-warn:` and labels
+the dispatch `<mode>-FAILED` in the timing line. Every interface and
+function-value call then has no target, as under `--dispatch off`.
+
+One limit: the declared implementations are a superset. They list every type of
+the dependency that fits the interface, not the one the library returns.
 
 ### Call-graph cache (cgstore)
 
@@ -88,10 +176,12 @@ prints `cgstore: disabled (<reason>)` (silently for `off`).
 
 The key covers the module path, scope, a SHA-256 of the `pc-fe` executable,
 the Go toolchain version, dispatch mode, fan-out cap, every emission flag,
-`--pb-paths`, `--mock-paths`, the `go.sum` hash and the store's schema
-version. Snapshots live under `<dir>/<module>/<key>/<commit>/`, and the
+`--dep-impls`, `--dep-bodies`, `--pb-paths`, `--mock-paths`, the `go.sum`
+hash and the store's schema version. Snapshots live under `<dir>/<module>/<key>/<commit>/`, and the
 newest 8 commits per key are kept. On replay the snapshot is checked against
-the freshly built SSA (function set, call-site counts, target ids); any
+the freshly built SSA (function set, call-site counts, target ids; a target
+id is an emitted function or a function that a dependency package declares);
+any
 mismatch prints `cgstore: <reason> — rebuilding` and falls back to a full
 build. On the `miniledger` fixture this takes the dispatch step from 4–8 ms
 to 1–2 ms.
@@ -131,8 +221,8 @@ gets a synthetic call site, appended after the real ones, that binds them.
 
 Call sites record kind (`STATIC`, `VIRTUAL`, `INVOKES_REMOTE`, `GO`,
 `DEFER`), argument and result counts, whether argument 0 is the receiver,
-`callee_fqn` for catalog matching, the resolved `callee_iids`, confidence,
-the `opaque` bit, and with `--error-results` a bitmask of `error`-typed
+`callee_fqn` for catalog matching, the resolved `callee_iids` (and, for
+dispatch targets, their fqns in `target_fqns`), confidence, the `opaque` bit, and with `--error-results` a bitmask of `error`-typed
 results. `BUILTIN` exists in the schema but is not emitted: a builtin call
 such as `len` is an `opaque` `STATIC` site whose `callee_fqn` is its
 signature.
@@ -387,8 +477,18 @@ kept in a struct field).
 
 ## 6. Identity
 
-- `iid` = SHA-256 over the length-prefixed repository, package path,
-  function name and signature. It survives body edits.
+- `iid` = SHA-256 over the length-prefixed owner, package path, function name
+  and signature. It survives body edits. The owner is the module that declares
+  the function's package, taken from the loader (`go list`): the module path in
+  that module's `go.mod`, also when a `replace` directive or `-mod=vendor`
+  supplies the source. A package with no module, such as the standard library,
+  is owned by the extracted module. So the iid of a library function is the
+  same in the library's own extraction and in every extraction that calls it,
+  and the core can link the call to the callee's summary. A generic instance,
+  or a wrapper with no package of its own, takes the owner of the package that
+  declares it. Functions of the extracted module keep the same iid. In a
+  `go.work` workspace, each package has the module that declares it, not the
+  first module in scope. Contract ids and topic cell ids have no owner.
 - **Generic instances** (and closures nested in them) are named and hashed
   from their type arguments' *identity*: aliases resolved at every depth,
   parameter names dropped, interfaces flattened to their method sets
@@ -407,7 +507,9 @@ kept in a struct field).
   The canonical form drops spans, field names and callee ids from the flow,
   so moving a line or renaming a field does not change it (except a heap-cell
   field under `--heap-slots`, whose `sym_name` is kept). Callees enter by
-  `iid`, so a change inside a callee does not change its callers' `bid`.
+  `iid`, so a change inside a callee does not change its callers' `bid`. A
+  caller of a function from another module has the callee's own iid in its
+  `bid`, so its `bid` changes once when the owner rule is applied.
 - `contract_iid` = the same hash over the contract name
   (`graphql:<Type>.<field>` for GraphQL, `http:<METHOD> <path>` for an HTTP
   route); a Kafka topic cell's `sym` is the same hash over
@@ -432,10 +534,15 @@ the `mr` manifest are written after the CGF.
 Every run prints to stderr:
 
 - `pc-fe timing: load=... ssa-build=... dispatch[<mode>]=...` (`<mode>-cached`
-  when replayed from cgstore);
-- `opaque: sites= opaque= capped= unresolved= dangling=`: total call sites,
-  opaque sites, sites over the fan-out cap, interface, function-value and
-  builtin calls with no targets, and resolved targets outside the emitted set;
+  when replayed from cgstore; `dep-bodies=...` follows `ssa-build` with
+  `--dep-bodies`);
+- `opaque: sites= opaque= capped= unresolved= dangling= external= dep-impls=`:
+  total call sites, opaque sites, sites over the fan-out cap, interface,
+  function-value and builtin calls with no targets, resolved targets outside
+  the emitted set and outside the dependency modules, sites with at least one
+  target that a dependency module declares, and interface calls whose targets
+  are the declared implementations in dependencies. A run that replays the
+  cgstore leaves out `dep-impls`;
 - with `--http-calls`, `http-calls: N sites, resolved_path=, dynamic_base=,
   unknown_method=, eval_budget=`: synthetic client sites, those whose path
   has a literal segment, those whose URL starts with an unresolved base,
@@ -457,13 +564,14 @@ Printed when they apply:
 | prefix | meaning |
 |---|---|
 | `load-warn: N of M packages have type errors and are left out of the CGF` | those packages are not in the CGF at all (a run where most packages fail stops instead); `--verbose` prints the errors |
-| `emit-warn: dangling callee iid` | a call target is not in the emitted set; the core will treat it as a library call |
+| `emit-warn: dangling callee iid` | a call target is neither emitted nor a function that a dependency module declares; the core will treat it as a library call |
 | `emit-warn: ... Unimplemented<Svc>Server but 0 gRPC handlers` | the server type exists but its handlers are outside `--scope` |
 | `contracts-warn:` | the generated `<Svc>Server` interface was not found; handlers were matched by shape |
 | `graphql-warn:` | a GraphQL name was derived from the Go method name |
 | `remote-clients:` | calls linked to a generated client by rule 3 of [gRPC clients](#grpc-clients) |
 | `remote-warn:` | gRPC-shaped calls on interfaces that no generated client, or more than one, implements |
 | `generics-gap:` | generic instantiations and call edges that could not be emitted |
+| `dispatch-warn:` | the call-graph builder panicked; dispatch is off for the run (the timing line says `<mode>-FAILED`) |
 | `cgstore:` | cache disabled, rebuilt after a failed replay, or failed to write |
 
 When no contract and no remote call was found, a multi-line hint lists the
@@ -512,12 +620,13 @@ supported generators and the current `--pb-paths`.
 
 Each directory under `fixtures/` holding a `go.mod` is its own module
 (`example.com/<name>`), so `go test ./...` does not build it; `kafka/producer`
-and `kafka/consumer` are a pair one level deeper. CI extracts all of them with
+and `kafka/consumer`, and `xmod/lib` and `xmod/app`, are pairs one level
+deeper. CI extracts all of them with
 `scripts/extract-fixtures.sh`; the core uses the extracted CGF as golden test
 data. Tests in `internal/callgraph` (`dispatch`), `internal/httproute`
 (`httpapi`), `internal/flow` (`httpclient`) and `internal/emit` (`httpapi`,
-`httpclient`, `kafka/*`) read fixtures directly. `httpapi` and the Kafka pair
-depend on the real router and Kafka libraries at pinned versions, so loading
+`httpclient`, `kafka/*`, `xmod/*`) read fixtures directly. `httpapi` and the
+Kafka pair depend on the real router and Kafka libraries at pinned versions, so loading
 them needs the module proxy or a filled module cache.
 
 Besides the lines every run prints ([Warnings](#warnings)), extracting
@@ -543,6 +652,7 @@ fallbacks on purpose.
 | `recursion` | recursion shapes: self-recursion, recursion through a return value, mutual recursion, a diamond, and interface dispatch to two implementations |
 | `httpapi` | one API on five routers mounted on one `ServeMux`: Go 1.22 patterns, chi `Route`/`Group`/`Mount`/`With` and a router passed to a function, gin groups and `ShouldBindJSON`, gorilla subrouter and `*Route` methods, echo; `r.Body` into SQL, and a handler passing only `ctx` to a constant query |
 | `httpclient` | `net/http` client calls with a configured base URL, `fmt.Sprintf`, `url.JoinPath`, a constant URL and an unknown method; calls `httpapi` |
+| `xmod/lib`, `xmod/app` | calls from one module into another through a `replace` directive. A plain function, a generic function and `strings.ToUpper` from a `net/http` handler: the callee iid of each `lib` function equals the iid in `lib`'s own CGF, and the standard library iid is owned by `app`. Interface calls into `lib`: a constructor that returns `lib`'s interface, a concrete unexported type, `lib`'s own interface, a method reached through a pointer receiver and one promoted by embedding, an app type and a `lib` type at one site, two implementations of which the constructor returns one, and one implementation that ignores its argument (the site keeps the default leaf). Sites that must not change: 11 implementations, an interface that only the standard library implements, and test doubles in `lib/mocks` and in a `_mock.go` file |
 | `kafka/producer`, `kafka/consumer` | a kafka-go writer and a sarama consumer group joined by topic `orders`, a decoy pair `audit-events` / `audit-log` that must not join; also sarama's async `Input()`, franz-go `DefaultProduceTopic` and `ConsumeTopics`, a kafka-go reader, an `os.Getenv` topic and a parameter topic |
 
 `federation`, `backend` and `downstream`, with panoptife-ts's `webapp`, form

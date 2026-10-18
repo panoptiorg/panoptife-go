@@ -40,15 +40,17 @@ type snapEntry struct {
 //   - every persisted caller iid resolves to an emittable function;
 //   - the caller's re-enumerated CallInstruction count equals n_callsites;
 //   - every callsite_id is in range;
-//   - every persisted callee iid resolves (targets were emittable at capture,
-//     so a miss means the emittable set drifted under the store key).
+//   - every persisted callee iid resolves: to an emitted function, or else to a
+//     function that a dependency package declares (ext, looked up on the first
+//     miss). Targets were one of the two at capture, so a miss means the
+//     function set drifted under the store key.
 //
 // skipCall (nil = keep all) drops CallInstructions that emit no CallSite —
 // with field paths on, flow canonicalizes trivial pb getters, so the ordinal
 // enumeration must apply the same filter (emit passes flow.IsCanonicalizedCall
 // when meta.FieldPaths; the flag is also in the store key, so a snapshot is
 // only ever replayed under the mode that captured it).
-func NewSnapshotResolver(meta *pb.Meta, shards map[string]*pb.PkgShard, fnByIID map[string]*ssa.Function, skipCall func(ssa.CallInstruction) bool) (*SnapshotResolver, error) {
+func NewSnapshotResolver(meta *pb.Meta, shards map[string]*pb.PkgShard, fnByIID map[string]*ssa.Function, skipCall func(ssa.CallInstruction) bool, ext *Externals) (*SnapshotResolver, error) {
 	r := &SnapshotResolver{
 		sites:            map[ssa.CallInstruction]snapEntry{},
 		GenericEdges:     int(meta.GenericEdges),
@@ -72,6 +74,9 @@ func NewSnapshotResolver(meta *pb.Meta, shards map[string]*pb.PkgShard, fnByIID 
 				e := snapEntry{conf: se.Confidence, capped: se.OpaqueByCap}
 				for _, iid := range se.CalleeIids {
 					t := fnByIID[string(iid)]
+					if t == nil {
+						t = ext.Lookup(iid)
+					}
 					if t == nil {
 						return nil, fmt.Errorf("%s: callee iid %x not in rebuilt fn set", fn, iid[:6])
 					}

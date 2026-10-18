@@ -132,6 +132,9 @@ func TestKeyChangesWithInputs(t *testing.T) {
 		// generic-instance iids (hash.CanonicalInstances)
 		"canonical-instance-ids": func(c *Config) { c.CanonicalInstances = true },
 		"heap-iface-identity":    func(c *Config) { c.HeapIfaceIdentity = true },
+		// dependency dispatch: both flags change the stored targets
+		"dep-impls":  func(c *Config) { c.DepImpls = true },
+		"dep-bodies": func(c *Config) { c.DepBodies = true },
 	} {
 		c := base
 		mut(&c)

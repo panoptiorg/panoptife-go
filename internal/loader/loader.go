@@ -7,6 +7,7 @@ package loader
 import (
 	"errors"
 	"fmt"
+	"go/types"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -27,14 +28,24 @@ import (
 )
 
 type Loaded struct {
-	Prog      *ssa.Program
-	InitPkgs  []*ssa.Package // in-scope packages (the ones we emit)
-	Module    string         // module path from go.mod, e.g. gitlab.example.com/acme/ledger-svc
+	Prog     *ssa.Program
+	InitPkgs []*ssa.Package // in-scope packages (the ones we emit)
+	Module   string         // module path from go.mod, e.g. gitlab.example.com/acme/ledger-svc
+	// Modules maps the import path of every loaded package, in-scope or not, to
+	// the module path that declares it. The standard library has no entry.
+	Modules   map[string]string
 	CommitSHA string
+	// deps holds the dependency packages: see DepPackages.
+	deps []*ssa.Package
+	// vtaFuncs is the function set VTA runs over once BuildDeps has run; nil
+	// means every function ssautil.AllFunctions finds.
+	vtaFuncs map[*ssa.Function]bool
 	// Phase wall-clocks + counters for the `pc-fe timing:` line, which emit
 	// prints once the dispatch decision (build vs cgstore reload) is known.
 	TLoad  time.Duration
 	TBuild time.Duration
+	// TDeps is the time BuildDeps took; zero when it did not run.
+	TDeps  time.Duration
 	NMocks int
 	// HasGRPCServer: the loaded closure declares at least one
 	// `Unimplemented<Svc>Server` type, i.e. this repo is a gRPC server even if
@@ -175,22 +186,13 @@ func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, 
 		fmt.Fprintf(os.Stderr, "load-warn: %d of %d packages have type errors and are left out of the CGF (e.g. %s); run with --verbose for the errors\n",
 			len(left), len(pkgs), strings.Join(firstN(left, 3), ", "))
 	}
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
-	for _, sp := range init {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(p *ssa.Package) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			p.Build()
-		}(sp)
-	}
-	wg.Wait()
+	buildPackages(init)
 	tBuild := time.Since(tBuildStart)
 
 	mod := moduleOf(pkgs)
 	return &Loaded{
+		Modules:       moduleMap(pkgs),
+		deps:          depPackages(pkgs, prog, mockPaths),
 		HasGRPCServer: hasGRPCServer(pkgs),
 		Prog:          prog,
 		InitPkgs:      init,
@@ -200,6 +202,101 @@ func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, 
 		TBuild:        tBuild,
 		NMocks:        nMocks,
 	}, nil
+}
+
+// buildPackages builds the function bodies of pkgs in parallel.
+//
+// ssa.Package.Build is concurrency-safe on distinct packages (idempotent,
+// self-synchronized), so this is a precision-free speedup of the SSA-build
+// phase.
+func buildPackages(pkgs []*ssa.Package) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
+	for _, sp := range pkgs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(p *ssa.Package) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			p.Build()
+		}(sp)
+	}
+	wg.Wait()
+}
+
+// DepPackages lists the dependency packages, sorted by import path: the ones
+// that the scope did not match, that a module declares (so not the standard
+// library) and that are not mock output (isMockPackage). Their functions have
+// no emitted body, but a call can still reach them. Dispatch uses the list to
+// name those targets.
+func (l *Loaded) DepPackages() []*ssa.Package { return l.deps }
+
+// BuildDeps builds the function bodies of DepPackages, so the call graph sees
+// the flows inside them. It must run before CallGraph. Building does not make a
+// dependency package part of the scope: nothing in it is emitted.
+//
+// ssautil.AllFunctions panics in x/tools v0.30.0 on some dependency bodies (a
+// type parameter reaches Program.RuntimeTypes). So the function set is taken
+// before the build, as AllFunctions finds it, and the functions of the
+// dependency packages are added by reading the packages' own tables: package
+// members, the declared methods of their named types and the anonymous
+// functions nested in these. Nothing here creates a function.
+func (l *Loaded) BuildDeps() {
+	t0 := time.Now()
+	l.vtaFuncs = ssautil.AllFunctions(l.Prog)
+	buildPackages(l.deps)
+	for _, sp := range l.deps {
+		for _, m := range sp.Members {
+			if fn, ok := m.(*ssa.Function); ok {
+				addFunc(l.vtaFuncs, fn)
+			}
+		}
+		scope := sp.Pkg.Scope()
+		for _, name := range scope.Names() {
+			tn, ok := scope.Lookup(name).(*types.TypeName)
+			if !ok || tn.IsAlias() {
+				continue
+			}
+			named, ok := tn.Type().(*types.Named)
+			if !ok || named.TypeParams().Len() > 0 {
+				continue
+			}
+			for i := 0; i < named.NumMethods(); i++ {
+				addFunc(l.vtaFuncs, l.Prog.FuncValue(named.Method(i)))
+			}
+		}
+	}
+	l.TDeps = time.Since(t0)
+}
+
+// addFunc adds fn and the anonymous functions nested in it.
+func addFunc(set map[*ssa.Function]bool, fn *ssa.Function) {
+	if fn == nil || set[fn] {
+		return
+	}
+	set[fn] = true
+	for _, anon := range fn.AnonFuncs {
+		addFunc(set, anon)
+	}
+}
+
+// depPackages finds the dependency packages among everything pkgs import.
+func depPackages(pkgs []*packages.Package, prog *ssa.Program, mockPaths pkgclass.MockPaths) []*ssa.Package {
+	roots := make(map[string]bool, len(pkgs))
+	for _, p := range pkgs {
+		roots[p.PkgPath] = true
+	}
+	var out []*ssa.Package
+	packages.Visit(pkgs, nil, func(p *packages.Package) {
+		if roots[p.PkgPath] || p.Module == nil || p.Module.Path == "" || p.Types == nil || isMockPackage(p, mockPaths) {
+			return
+		}
+		if sp := prog.Package(p.Types); sp != nil {
+			out = append(out, sp)
+		}
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Pkg.Path() < out[j].Pkg.Path() })
+	return out
 }
 
 // checkModule fails when dir does not exist, is not a directory, or is not
@@ -258,20 +355,40 @@ func unmatchedPattern(pkgs []*packages.Package) string {
 // extraction cost on large repos; CHA is near-linear but over-approximates
 // (doc 21 §4.3b); "off" skips the build entirely — function-value calls are
 // then opaque, interface calls get no targets but are not marked opaque.
+// A panic inside the builder yields a nil graph; CallGraph reports it.
 func BuildCallGraph(prog *ssa.Program, dispatch string) (*callgraph.Graph, time.Duration) {
+	cg, d, _ := buildCallGraph(prog, dispatch, nil)
+	return cg, d
+}
+
+// CallGraph is BuildCallGraph over the loaded program. After BuildDeps, VTA
+// runs over the function set that BuildDeps collected. The error is set when
+// the builder panicked (it can on incomplete SSA); the graph is then nil and
+// the caller must say so, because every dynamic call is left without a target.
+func (l *Loaded) CallGraph(dispatch string) (*callgraph.Graph, time.Duration, error) {
+	return buildCallGraph(l.Prog, dispatch, l.vtaFuncs)
+}
+
+func buildCallGraph(prog *ssa.Program, dispatch string, funcs map[*ssa.Function]bool) (cg *callgraph.Graph, d time.Duration, err error) {
 	t0 := time.Now()
-	var cg *callgraph.Graph
 	func() {
-		defer func() { _ = recover() }() // can panic on incomplete SSA; degrade gracefully
+		defer func() {
+			if r := recover(); r != nil {
+				cg, err = nil, fmt.Errorf("%s call graph panicked: %v", dispatch, r)
+			}
+		}()
 		switch dispatch {
 		case "off":
 		case "cha":
 			cg = cha.CallGraph(prog)
 		default:
-			cg = vta.CallGraph(ssautil.AllFunctions(prog), nil)
+			if funcs == nil {
+				funcs = ssautil.AllFunctions(prog)
+			}
+			cg = vta.CallGraph(funcs, nil)
 		}
 	}()
-	return cg, time.Since(t0)
+	return cg, time.Since(t0), err
 }
 
 // isMockPackage reports whether p is mockgen output: a `/mocks/` (or `/mock/`)
@@ -392,6 +509,19 @@ func moduleOf(pkgs []*packages.Package) string {
 		}
 	}
 	return ""
+}
+
+// moduleMap maps every package reachable from pkgs to the path of its module.
+// A replace directive does not change it: the path is the one the module's own
+// go.mod declares, which is what the module's own extraction uses.
+func moduleMap(pkgs []*packages.Package) map[string]string {
+	m := map[string]string{}
+	packages.Visit(pkgs, nil, func(p *packages.Package) {
+		if p.Module != nil && p.Module.Path != "" {
+			m[p.PkgPath] = p.Module.Path
+		}
+	})
+	return m
 }
 
 func gitHead(dir string) string {

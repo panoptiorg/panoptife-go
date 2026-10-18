@@ -29,7 +29,7 @@ type GrpcMethod struct {
 }
 
 // Extract scans in-scope SSA packages for gRPC server implementations.
-func Extract(prog *ssa.Program, inScope map[*ssa.Package]bool, repo string) []GrpcMethod {
+func Extract(prog *ssa.Program, inScope map[*ssa.Package]bool, owner hash.Owner) []GrpcMethod {
 	var out []GrpcMethod
 	seen := map[string]bool{}
 	for sp := range inScope {
@@ -90,7 +90,7 @@ func Extract(prog *ssa.Program, inScope map[*ssa.Package]bool, repo string) []Gr
 				ssaFn := prog.FuncValue(fn)
 				var hiid []byte
 				if ssaFn != nil {
-					hiid = hash.IID(repo, ssaFn)
+					hiid = owner.IID(ssaFn)
 				}
 				out = append(out, GrpcMethod{
 					FullName:        full,

@@ -5,6 +5,7 @@ import (
 
 	"golang.org/x/tools/go/ssa"
 
+	"github.com/panoptiorg/panoptife-go/internal/hash"
 	"github.com/panoptiorg/panoptife-go/internal/loader"
 )
 
@@ -42,7 +43,7 @@ func TestExtractStreamsvc(t *testing.T) {
 	for _, sp := range ld.InitPkgs {
 		inScope[sp] = true
 	}
-	gms := Extract(ld.Prog, inScope, "test")
+	gms := Extract(ld.Prog, inScope, hash.Owner{Repo: "test"})
 
 	type st struct{ client, server bool }
 	want := map[string]st{

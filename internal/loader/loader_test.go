@@ -1,12 +1,18 @@
 package loader
 
 import (
+	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/ssa/ssautil"
+
+	"github.com/panoptiorg/panoptife-go/internal/hash"
 )
 
 // Doc 16 §3.7 guards: error tolerance must never emit an (almost) empty CGF.
@@ -114,5 +120,175 @@ func TestCheckModule(t *testing.T) {
 	}
 	if err := checkModule(file); err == nil || err.Error() != "not a directory: "+file {
 		t.Fatalf("file: err = %v, want not a directory", err)
+	}
+}
+
+// The first iid field is the module that declares the function's package, not
+// the module that was extracted.
+func TestOwnerIsDeclaringModule(t *testing.T) {
+	ld, err := Load("../../fixtures/xmod/app", "./...", false, true, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const app, lib = "example.com/xmod/app", "example.com/xmod/lib"
+	owner := hash.Owner{Repo: ld.Module, Modules: ld.Modules}
+	if ld.Module != app {
+		t.Fatalf("module = %q, want %q", ld.Module, app)
+	}
+
+	fetch := ld.Prog.ImportedPackage(lib).Func("Fetch")
+	toUpper := ld.Prog.ImportedPackage("strings").Func("ToUpper")
+	user := ld.Prog.ImportedPackage(app).Func("user")
+	var mapInst *ssa.Function
+	for fn := range ssautil.AllFunctions(ld.Prog) {
+		if strings.HasPrefix(fn.String(), lib+".Map[") {
+			mapInst = fn
+		}
+	}
+	if fetch == nil || toUpper == nil || user == nil || mapInst == nil {
+		t.Fatalf("missing function: Fetch=%v ToUpper=%v user=%v Map instance=%v", fetch, toUpper, user, mapInst)
+	}
+	// The app requires lib through a replace directive; the owner is still the
+	// module path lib declares in its own go.mod.
+	if m := ld.Modules[lib]; m != lib {
+		t.Errorf("Modules[%s] = %q, want %q", lib, m, lib)
+	}
+	for _, c := range []struct {
+		name string
+		fn   *ssa.Function
+		want string
+	}{
+		{"function of the extracted module", user, app},
+		{"function of another module", fetch, lib},
+		{"generic instance, no package of its own", mapInst, lib},
+		{"standard library", toUpper, app},
+	} {
+		if got := owner.Of(c.fn); got != c.want {
+			t.Errorf("%s: owner %q, want %q", c.name, got, c.want)
+		}
+		if !bytes.Equal(owner.IID(c.fn), hash.IID(c.want, c.fn)) {
+			t.Errorf("%s: Owner.IID differs from IID(%q)", c.name, c.want)
+		}
+	}
+	// Without a module map every function belongs to the extracted repo.
+	if got := (hash.Owner{Repo: "r"}).Of(fetch); got != "r" {
+		t.Errorf("no module map: owner %q, want r", got)
+	}
+}
+
+// Several modules in one go.work workspace: each package is owned by its own
+// module, whichever module comes first.
+func TestOwnerInWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.work", "go 1.25\n\nuse (\n\t./a\n\t./b\n)\n")
+	write("a/go.mod", "module example.com/ws/a\n\ngo 1.25\n")
+	write("a/a.go", "package a\n\nimport \"example.com/ws/b\"\n\nfunc A() string { return b.B() }\n")
+	write("b/go.mod", "module example.com/ws/b\n\ngo 1.25\n")
+	write("b/b.go", "package b\n\nfunc B() string { return \"b\" }\n")
+
+	ld, err := Load(filepath.Join(dir, "a"), "./...", false, true, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := hash.Owner{Repo: ld.Module, Modules: ld.Modules}
+	for pkg, want := range map[string]string{"example.com/ws/a": "example.com/ws/a", "example.com/ws/b": "example.com/ws/b"} {
+		sp := ld.Prog.ImportedPackage(pkg)
+		if sp == nil {
+			t.Fatalf("package %s not loaded", pkg)
+		}
+		name := strings.ToUpper(pkg[len(pkg)-1:])
+		if got := owner.Of(sp.Func(name)); got != want {
+			t.Errorf("%s.%s: owner %q, want %q", pkg, name, got, want)
+		}
+	}
+}
+
+// With -mod=vendor go list still reports the module of a vendored package,
+// from vendor/modules.txt.
+func TestOwnerInVendorMode(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("dep/go.mod", "module example.com/vend/dep\n\ngo 1.25\n")
+	write("dep/dep.go", "package dep\n\nfunc D() string { return \"d\" }\n")
+	write("app/go.mod", "module example.com/vend/app\n\ngo 1.25\n\nrequire example.com/vend/dep v0.0.0\n\nreplace example.com/vend/dep => ../dep\n")
+	write("app/app.go", "package app\n\nimport \"example.com/vend/dep\"\n\nfunc A() string { return dep.D() }\n")
+	cmd := exec.Command("go", "mod", "vendor")
+	cmd.Dir = filepath.Join(dir, "app")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("go mod vendor: %v\n%s", err, out)
+	}
+
+	t.Setenv("GOFLAGS", "-mod=vendor")
+	ld, err := Load(filepath.Join(dir, "app"), "./...", false, true, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := ld.Modules["example.com/vend/dep"]; m != "example.com/vend/dep" {
+		t.Errorf("vendored package: module %q, want example.com/vend/dep", m)
+	}
+}
+
+// The scope's own packages are built; dependency packages are listed and built
+// only on request. Mock packages and the standard library are not dependency
+// packages here.
+func TestBuildDeps(t *testing.T) {
+	ld, err := Load("../../fixtures/xmod/app", "./...", false, true, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deps []string
+	for _, sp := range ld.DepPackages() {
+		deps = append(deps, sp.Pkg.Path())
+	}
+	if strings.Join(deps, ",") != "example.com/xmod/lib,example.com/xmod/lib/pb" {
+		t.Fatalf("dependency packages %v, want lib and lib/pb", deps)
+	}
+	fetch := ld.Prog.ImportedPackage("example.com/xmod/lib").Func("Fetch")
+	if len(fetch.Blocks) != 0 {
+		t.Fatal("a dependency package must not be built by Load")
+	}
+	ld.BuildDeps()
+	if len(fetch.Blocks) == 0 || ld.TDeps <= 0 {
+		t.Errorf("after BuildDeps: %d blocks, took %v", len(fetch.Blocks), ld.TDeps)
+	}
+	if len(ld.InitPkgs) != 1 {
+		t.Errorf("BuildDeps changed the scope: %d in-scope packages", len(ld.InitPkgs))
+	}
+}
+
+// A panic inside the call-graph builder is returned, not swallowed: the caller
+// must say that dispatch is gone.
+func TestCallGraphPanicIsReported(t *testing.T) {
+	ld, err := Load("../../fixtures/xmod/app", "./...", false, true, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ld.vtaFuncs = map[*ssa.Function]bool{nil: true}
+	cg, _, err := ld.CallGraph("vta")
+	if err == nil || cg != nil || !strings.Contains(err.Error(), "panicked") {
+		t.Errorf("CallGraph over a broken function set = (%v, %v), want a nil graph and a panic error", cg, err)
+	}
+	ld.vtaFuncs = nil
+	if cg, _, err := ld.CallGraph("vta"); err != nil || cg == nil {
+		t.Errorf("CallGraph = (%v, %v), want a graph", cg, err)
 	}
 }
