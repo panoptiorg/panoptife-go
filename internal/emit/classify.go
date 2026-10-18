@@ -8,22 +8,15 @@ import (
 	pb "github.com/panoptiorg/panoptife-go/internal/cgfpb"
 )
 
-// excludedFile reports whether a file is a test or mock (excluded from analysis,
-// doc 02 §5). Generated proto/gqlgen is NOT excluded here — it is kept, flagged.
-func excludedFile(path string) bool {
+// excludedFile reports whether a file is a test or mock (excluded from
+// analysis). isMock decides mock files, by name or by generator header.
+// Generated proto/gqlgen is NOT excluded here — it is kept, flagged.
+func excludedFile(path string, isMock func(string) bool) bool {
 	base := path[strings.LastIndex(path, "/")+1:]
-	switch {
-	case strings.HasSuffix(base, "_test.go"):
-		return true
-	case strings.HasSuffix(base, "_mock.go"):
-		return true
-	case strings.HasPrefix(base, "zzz_"):
-		return true
-	}
-	return false
+	return strings.HasSuffix(base, "_test.go") || isMock(path)
 }
 
-func generatorOf(path string) pb.Generator {
+func generatorOf(path string, isMock func(string) bool) pb.Generator {
 	base := path[strings.LastIndex(path, "/")+1:]
 	switch {
 	case strings.HasSuffix(base, ".pb.go"),
@@ -33,7 +26,7 @@ func generatorOf(path string) pb.Generator {
 	case strings.HasSuffix(base, ".generated.go"),
 		strings.HasSuffix(base, "models_gen.go"):
 		return pb.Generator_GEN_GQLGEN
-	case strings.HasSuffix(base, "_mock.go"), strings.HasPrefix(base, "zzz_"):
+	case isMock(path):
 		return pb.Generator_GEN_MOCKGEN
 	}
 	return pb.Generator_GEN_NONE

@@ -66,7 +66,7 @@ Input and output:
 | `--out` | `<module-dir>/../output/cgf/<module path, sanitized>` | output directory; see above |
 | `-v`, `--verbose` | `false` | print per-package load errors, one `wrote <file> (<n> functions)` line per file, and the cgstore write line |
 | `--allow-missing-scope` | `false` | continue when a `--scope` pattern that is a literal import path loaded nothing. Wildcard and relative patterns (`./...`, `./x`) are never checked |
-| `--include-mocks` | `false` | build and emit mock packages instead of dropping them. Files named `*_mock.go` or `zzz_*` are excluded either way |
+| `--include-mocks` | `false` | build and emit mock packages instead of dropping them. Mock files (`*_mock.go`, `zzz_*`, or a generated-code header of mockgen, mockery, minimock, counterfeiter or moq) are excluded either way |
 | `--mock-paths` | `mock,mocks` | path segments that mark a mock package. Each entry must be a single segment |
 | `--pb-paths` | `pb,api` | path segments that mark a generated protobuf package: the import path contains `/<seg>/` or ends in `/<seg>`. Each entry must be a single segment. Controls remote-call recognition, stream ports, getter canonicalisation and which handler parameters are untrusted |
 | `--require-contracts` | `false` | exit 3 when no boundary was extracted: no gRPC method, GraphQL field, HTTP route or message consumer, and no remote call, HTTP client or Kafka topic site. The CGF is written first |

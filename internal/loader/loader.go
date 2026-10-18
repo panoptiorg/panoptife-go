@@ -52,12 +52,40 @@ type Loaded struct {
 	// the generated package is out of scope. Emit warns when this is true and it
 	// extracted zero gRPC methods — the shape debt A3 produced three times.
 	HasGRPCServer bool
+	// mockHeaders holds the files, in every visited package with syntax, whose
+	// generated-code header names a mock generator. Read it with IsMockFile.
+	mockHeaders map[string]bool
+}
+
+// IsMockFile reports whether path is a mock file: it follows mockgen's file
+// naming (`_mock.go`, `zzz_`) or its header names a mock generator (mockgen,
+// mockery, minimock, counterfeiter, moq). It answers for dependency files too.
+func (l *Loaded) IsMockFile(path string) bool {
+	return isMockFile(path, l.mockHeaders)
+}
+
+func isMockFile(path string, headers map[string]bool) bool {
+	return pkgclass.MockFileName(path) || headers[path]
+}
+
+// mockHeaderFiles returns the files of the whole closure of pkgs whose header
+// names a mock generator, keyed by the file name the SSA positions use.
+func mockHeaderFiles(pkgs []*packages.Package) map[string]bool {
+	out := map[string]bool{}
+	packages.Visit(pkgs, nil, func(p *packages.Package) {
+		for _, f := range p.Syntax {
+			if pkgclass.MockHeader(f) {
+				out[p.Fset.Position(f.Package).Filename] = true
+			}
+		}
+	})
+	return out
 }
 
 // Load loads `scope` (comma-separated package patterns) rooted at repoDir.
 // When excludeMocks is set, packages classified as mock (mockgen output —
-// `/mocks/` path segment or a package whose only non-test files are `_mock.go`
-// / `zzz_` generated) are dropped from the SSA-build set: they are never built,
+// `/mocks/` path segment or a package whose only non-test files are mock
+// files, by name or by generated-code header) are dropped from the SSA-build set: they are never built,
 // emitted, or fed to VTA. Mocks are test doubles — analyzing them is pure cost
 // and pure noise (they balloon SSA/VTA; doc 21 §4.2).
 // The dispatch call graph is NOT built here — emit decides between
@@ -68,7 +96,7 @@ type Loaded struct {
 // number taken from it is a floor, not a measurement.
 // mockPaths configures the mock DIRECTORY segments only (zero value =
 // "mock,mocks"); mockgen's own output naming (`mock_` prefix, `_mock.go` /
-// `zzz_` files) is not configurable.
+// `zzz_` files) and the generator headers are not configurable.
 func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, mockPaths pkgclass.MockPaths) (*Loaded, error) {
 	if err := checkModule(repoDir); err != nil {
 		return nil, err
@@ -136,12 +164,13 @@ func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, 
 	prog, ssaPkgs := ssautil.AllPackages(pkgs, ssa.InstantiateGenerics)
 	init := make([]*ssa.Package, 0, len(ssaPkgs))
 	nMocks := 0
+	mockHeaders := mockHeaderFiles(pkgs)
 	dropped := map[string]bool{} // deliberately excluded ⇒ not "missing"
 	for i, sp := range ssaPkgs {
 		if sp == nil {
 			continue
 		}
-		if excludeMocks && i < len(pkgs) && isMockPackage(pkgs[i], mockPaths) {
+		if excludeMocks && i < len(pkgs) && isMockPackage(pkgs[i], mockPaths, mockHeaders) {
 			nMocks++
 			dropped[pkgs[i].PkgPath] = true
 			continue // never build/emit/VTA a mock package
@@ -192,7 +221,7 @@ func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, 
 	mod := moduleOf(pkgs)
 	return &Loaded{
 		Modules:       moduleMap(pkgs),
-		deps:          depPackages(pkgs, prog, mockPaths),
+		deps:          depPackages(pkgs, prog, mockPaths, mockHeaders),
 		HasGRPCServer: hasGRPCServer(pkgs),
 		Prog:          prog,
 		InitPkgs:      init,
@@ -201,6 +230,7 @@ func Load(repoDir, scope string, verbose, excludeMocks, allowMissingScope bool, 
 		TLoad:         tLoad,
 		TBuild:        tBuild,
 		NMocks:        nMocks,
+		mockHeaders:   mockHeaders,
 	}, nil
 }
 
@@ -281,14 +311,14 @@ func addFunc(set map[*ssa.Function]bool, fn *ssa.Function) {
 }
 
 // depPackages finds the dependency packages among everything pkgs import.
-func depPackages(pkgs []*packages.Package, prog *ssa.Program, mockPaths pkgclass.MockPaths) []*ssa.Package {
+func depPackages(pkgs []*packages.Package, prog *ssa.Program, mockPaths pkgclass.MockPaths, headers map[string]bool) []*ssa.Package {
 	roots := make(map[string]bool, len(pkgs))
 	for _, p := range pkgs {
 		roots[p.PkgPath] = true
 	}
 	var out []*ssa.Package
 	packages.Visit(pkgs, nil, func(p *packages.Package) {
-		if roots[p.PkgPath] || p.Module == nil || p.Module.Path == "" || p.Types == nil || isMockPackage(p, mockPaths) {
+		if roots[p.PkgPath] || p.Module == nil || p.Module.Path == "" || p.Types == nil || isMockPackage(p, mockPaths, headers) {
 			return
 		}
 		if sp := prog.Package(p.Types); sp != nil {
@@ -394,10 +424,10 @@ func buildCallGraph(prog *ssa.Program, dispatch string, funcs map[*ssa.Function]
 // isMockPackage reports whether p is mockgen output: a `/mocks/` (or `/mock/`)
 // path segment, a `mock_*` path segment or package name (mockgen's
 // one-package-per-directory layout, e.g. internal/test/mock_events), or a
-// package whose every non-test source file is a mock-generated file
-// (`_mock.go` / `zzz_*`). Test doubles only — excluded from analysis entirely
-// when excludeMocks is set.
-func isMockPackage(p *packages.Package, mockPaths pkgclass.MockPaths) bool {
+// package whose every non-test source file is a mock file (`_mock.go` /
+// `zzz_*`, or a header in headers that names a mock generator). Test doubles
+// only — excluded from analysis entirely when excludeMocks is set.
+func isMockPackage(p *packages.Package, mockPaths pkgclass.MockPaths, headers map[string]bool) bool {
 	if p == nil {
 		return false
 	}
@@ -416,7 +446,7 @@ func isMockPackage(p *packages.Package, mockPaths pkgclass.MockPaths) bool {
 			continue
 		}
 		sawSource = true
-		if !strings.HasSuffix(base, "_mock.go") && !strings.HasPrefix(base, "zzz_") {
+		if !isMockFile(f, headers) {
 			return false // a real source file ⇒ not a pure mock package
 		}
 	}
