@@ -149,6 +149,15 @@ type Options struct {
 	// because it taints every ctx the request hands out (E3). A measurement
 	// instrument, default off.
 	HTTPSeedRequest bool
+	// NoDepImpls turns off the declared-implementations rule: an interface call
+	// with no resolved target then keeps no target, as before. Targets that the
+	// call graph itself finds in a dependency stay. Default on.
+	NoDepImpls bool
+	// DepBodies also builds the SSA bodies of dependency packages before the
+	// call graph, so it sees flows that run through them. It does not change
+	// which functions are emitted. It costs time, roughly double the SSA and
+	// call-graph phases, so it is opt-in.
+	DepBodies bool
 }
 
 // flowOpts is the single place the CLI's escape-hatch polarity (No*) is
@@ -179,7 +188,9 @@ func (o Options) flowOpts() flow.Opts {
 //	1 -> 2 (doc 36 §1): GraphqlField.args, GraphqlArg, CallSite.arg_names;
 //	       GraphqlField.type_field became SDL-exact ("AuthMutations.login"),
 //	       which changes graphql contract iids.
-const schemaVersion = 2
+//	2 -> 3: CallSite.target_fqns; dispatch targets in other modules; callee
+//	       iids owned by the declaring module.
+const schemaVersion = 3
 
 func Run(o Options) error {
 	hash.CanonicalInstances = !o.NoCanonicalInstanceIDs
@@ -199,6 +210,7 @@ func Run(o Options) error {
 	if repo == "" {
 		repo = filepath.Base(o.RepoDir)
 	}
+	owner := hash.Owner{Repo: repo, Modules: ld.Modules}
 	mode := o.Dispatch
 	if mode == "" {
 		mode = "vta"
@@ -262,20 +274,70 @@ func Run(o Options) error {
 			}
 		}
 	}
+	// ssautil.AllFunctions reaches a method of an unexported type only when the
+	// package converts the type to an interface. A package that returns such a
+	// type from an exported function never does, and the module that calls it
+	// then links to a summary that does not exist. So emit the declared methods
+	// of every named type of an in-scope package. FuncValue reads the table of
+	// declared functions; MethodValue would create functions and change the
+	// output.
+	have := make(map[*ssa.Function]bool, len(fns))
+	for _, fn := range fns {
+		have[fn] = true
+	}
+	for _, sp := range ld.InitPkgs {
+		scope := sp.Pkg.Scope()
+		for _, name := range scope.Names() {
+			tn, ok := scope.Lookup(name).(*types.TypeName)
+			if !ok || tn.IsAlias() {
+				continue
+			}
+			named, ok := tn.Type().(*types.Named)
+			if !ok || named.TypeParams().Len() > 0 {
+				continue
+			}
+			for i := 0; i < named.NumMethods(); i++ {
+				if fn := ld.Prog.FuncValue(named.Method(i)); fn != nil && !have[fn] && emittable(fn) {
+					have[fn] = true
+					fns = append(fns, fn)
+				}
+			}
+		}
+	}
 	sort.Slice(fns, func(i, j int) bool { return hash.FQN(fns[i]) < hash.FQN(fns[j]) })
 
 	// Precompute iids for all in-scope functions (needed to embed callee iids).
 	iidOf := map[*ssa.Function][]byte{}
 	for _, fn := range fns {
-		iidOf[fn] = hash.IID(repo, fn)
+		iidOf[fn] = owner.IID(fn)
 	}
 
 	// Dispatch: replay a cgstore snapshot when one validates against this
 	// commit + function universe; otherwise build the vta/cha graph live (and,
 	// with the store enabled, persist what emit consumed after the CGF write).
-	disp, resolver, store, tCG, dispatchLabel := resolveDispatch(o, ld, repo, mode, iidOf, emittable)
-	fmt.Fprintf(os.Stderr, "pc-fe timing: load=%s ssa-build=%s dispatch[%s]=%s (in-scope pkgs=%d, mocks-excluded=%d, procs=%d)\n",
-		ld.TLoad.Round(time.Millisecond), ld.TBuild.Round(time.Millisecond),
+	// Functions that dependency modules declare: dispatch may name them, and a
+	// call to one links to the summary in that module's own CGF.
+	ext := callgraph.NewExternals(ld.Prog, owner, ld.DepPackages(), func(fn *ssa.Function) bool {
+		return excludedFile(fileOf(fn))
+	}, !o.NoDepImpls)
+	// Building dependency bodies can create instances of in-scope generic
+	// functions that the collection above never saw. Only functions collected
+	// above get an iid, so only they may be targets.
+	keep := emittable
+	if o.DepBodies {
+		known := make(map[*ssa.Function]bool, len(fns))
+		for _, fn := range fns {
+			known[fn] = true
+		}
+		keep = func(fn *ssa.Function) bool { return known[fn] && emittable(fn) }
+	}
+	disp, resolver, store, tCG, dispatchLabel := resolveDispatch(o, ld, repo, mode, iidOf, keep, ext)
+	depTiming := ""
+	if ld.TDeps > 0 {
+		depTiming = fmt.Sprintf(" dep-bodies=%s", ld.TDeps.Round(time.Millisecond))
+	}
+	fmt.Fprintf(os.Stderr, "pc-fe timing: load=%s ssa-build=%s%s dispatch[%s]=%s (in-scope pkgs=%d, mocks-excluded=%d, procs=%d)\n",
+		ld.TLoad.Round(time.Millisecond), ld.TBuild.Round(time.Millisecond), depTiming,
 		dispatchLabel, tCG.Round(time.Millisecond), len(ld.InitPkgs), ld.NMocks, runtime.GOMAXPROCS(0))
 
 	// Build Function facts, grouped by package.
@@ -314,7 +376,7 @@ func Run(o Options) error {
 	nRemoteSites := 0
 	var sc siteCensus
 	for _, fn := range fns {
-		f, ce, fnSC := buildFunction(repo, disp, fn, iidOf, capturing, fo)
+		f, ce, fnSC := buildFunction(owner, ext, disp, fn, iidOf, capturing, fo)
 		if f.Flow != nil {
 			for _, cs := range f.Flow.Callsites {
 				if cs.Kind == pb.CallSite_INVOKES_REMOTE {
@@ -368,8 +430,16 @@ func Run(o Options) error {
 	// capped fan-out (resolver.TargetsAt's cappedOpaque) vs. genuinely
 	// unresolved dynamic dispatch (zero targets, not capped) vs. a resolved
 	// target that never got emitted (the "dangling callee iid" warn below).
-	fmt.Fprintf(os.Stderr, "opaque: sites=%d opaque=%d capped=%d unresolved=%d dangling=%d\n",
-		sc.sites, sc.opaque, sc.capped, sc.unresolved, sc.dangling)
+	// external counts sites with a target in a dependency module (its iid is
+	// the one that module's own CGF has); dep-impls counts the interface calls
+	// whose targets are the declared implementations in dependencies. A replay
+	// from the cgstore does not know the second, so it leaves it out.
+	opaqueLine := fmt.Sprintf("opaque: sites=%d opaque=%d capped=%d unresolved=%d dangling=%d external=%d",
+		sc.sites, sc.opaque, sc.capped, sc.unresolved, sc.dangling, sc.external)
+	if r, ok := disp.(*callgraph.Resolver); ok && r != nil {
+		opaqueLine += fmt.Sprintf(" dep-impls=%d", sc.depImpls)
+	}
+	fmt.Fprintln(os.Stderr, opaqueLine)
 	// coverage wave 1 §2.3: how many client URLs were recovered, and how many
 	// only as a suffix behind an unresolved base — the share the core's suffix
 	// match has to absorb.
@@ -380,7 +450,7 @@ func Run(o Options) error {
 
 	// gRPC contract facts: GRPCMethod endpoints + handler binds_to.
 	nGrpc := 0
-	for _, gm := range contracts.Extract(ld.Prog, inScope, repo) {
+	for _, gm := range contracts.Extract(ld.Prog, inScope, owner) {
 		if gm.HandlerFn == nil {
 			continue
 		}
@@ -428,7 +498,7 @@ func Run(o Options) error {
 	// GraphQL resolver facts: field endpoints + resolver binds_to + untrusted
 	// arg seeding via source_params (doc 19).
 	nGql := 0
-	for _, gf := range graphql.Extract(ld.Prog, inScope, repo) {
+	for _, gf := range graphql.Extract(ld.Prog, inScope, owner) {
 		nGql++
 		pkgPath := hash.PackagePath(gf.ResolverFn)
 		cp := getPkg(pkgPath)
@@ -760,6 +830,8 @@ type siteCensus struct {
 	capped     int // opaque because TargetsAt's fan-out cap tripped
 	unresolved int // interface, func-value or builtin call with zero targets, uncapped; opaque unless an interface call
 	dangling   int // resolved target whose iid was never emitted (scope gap)
+	external   int // sites with a target that a dependency module declares
+	depImpls   int // interface calls whose targets are the declared implementations in dependencies
 	// coverage wave 1 §2.3 / §2.4 censuses, carried up from flow.Build
 	http   flow.HTTPCallCensus
 	topics flow.TopicCensus
@@ -771,16 +843,19 @@ func (s *siteCensus) add(o siteCensus) {
 	s.capped += o.capped
 	s.unresolved += o.unresolved
 	s.dangling += o.dangling
+	s.external += o.external
+	s.depImpls += o.depImpls
 	s.http.Add(o.http)
 	s.topics.Add(o.topics)
 }
 
-func buildFunction(repo string, disp flow.Dispatcher, fn *ssa.Function, iidOf map[*ssa.Function][]byte, capture bool, fo flow.Opts) (*pb.Function, *spb.CallerEdges, siteCensus) {
+func buildFunction(owner hash.Owner, ext *callgraph.Externals, disp flow.Dispatcher, fn *ssa.Function, iidOf map[*ssa.Function][]byte, capture bool, fo flow.Opts) (*pb.Function, *spb.CallerEdges, siteCensus) {
 	res := flow.Build(fn, disp, fo)
 	sc := siteCensus{
 		sites:      len(res.Flow.Callsites),
 		capped:     res.CappedSites,
 		unresolved: res.UnresolvedDynamicSites,
+		depImpls:   res.DepImplSites,
 		http:       res.HTTPCalls,
 		topics:     res.Topics,
 	}
@@ -803,6 +878,10 @@ func buildFunction(repo string, disp flow.Dispatcher, fn *ssa.Function, iidOf ma
 			sc.opaque++
 		}
 		var ids [][]byte
+		// targetIDs and resolverConf are what the snapshot stores for a site
+		// with dispatch targets: the resolver's answer, before any entry is added.
+		var targetIDs [][]byte
+		resolverConf := cs.DispatchConfidence
 		switch {
 		case callee.Kind == pb.CallSite_INVOKES_REMOTE && callee.RemoteFullName != "":
 			// cross-repo: key by the shared contract identity.
@@ -811,24 +890,48 @@ func buildFunction(repo string, disp flow.Dispatcher, fn *ssa.Function, iidOf ma
 			if id, ok := iidOf[callee.Static]; ok {
 				ids = append(ids, id)
 			} else {
-				ids = append(ids, hash.IID(repo, callee.Static))
+				ids = append(ids, owner.IID(callee.Static))
 			}
 		case len(callee.Targets) > 0:
+			hasExternal := false
 			for _, t := range callee.Targets {
+				cs.TargetFqns = append(cs.TargetFqns, hash.FQN(t))
 				if id, ok := iidOf[t]; ok {
 					ids = append(ids, id)
+				} else if ext.Is(t) {
+					// A function of a dependency module: no body here, but the
+					// module's own CGF holds its summary under this iid.
+					hasExternal = true
+					ids = append(ids, owner.IID(t))
 				} else {
-					// Resolver targets outside the emitted set (dep package,
-					// excluded file) produce iids no summary will ever match —
-					// the chain silently leafs there. Loud so scope gaps surface.
+					// Resolver targets outside the emitted set (excluded file,
+					// out-of-scope wrapper) produce iids no summary will ever
+					// match — the chain silently leafs there. Loud so scope gaps
+					// surface.
 					fmt.Fprintf(os.Stderr, "emit-warn: dangling callee iid: %s -> %s (target not emitted)\n", hash.FQN(fn), hash.FQN(t))
 					sc.dangling++
-					ids = append(ids, hash.IID(repo, t))
+					ids = append(ids, owner.IID(t))
 				}
+			}
+			if hasExternal {
+				sc.external++
+				// The targets cannot be all the code that can run here: a
+				// type of the standard library, of a mock or of unbuilt code is
+				// never among them. Keep the entry that the site has without
+				// targets, so the core still applies its default leaf next to
+				// the summaries it finds. The snapshot below stores the
+				// targets only, and a replay appends this entry again.
+				targetIDs, resolverConf = ids, cs.DispatchConfidence
+				ids = append(ids[:len(ids):len(ids)], hash.IIDFromParts("", "", callee.FQN, ""))
+				cs.TargetFqns = append(cs.TargetFqns, callee.FQN)
+				cs.DispatchConfidence = 1 / float32(len(ids))
 			}
 		default:
 			// external / unresolved: synthesize an iid from the fqn.
 			ids = append(ids, hash.IIDFromParts("", "", callee.FQN, ""))
+		}
+		if targetIDs == nil {
+			targetIDs = ids
 		}
 		cs.CalleeIids = ids
 		calleeIIDs = append(calleeIIDs, ids...)
@@ -841,7 +944,7 @@ func buildFunction(repo string, disp flow.Dispatcher, fn *ssa.Function, iidOf ma
 		if ce != nil {
 			switch {
 			case len(callee.Targets) > 0:
-				ce.Sites = append(ce.Sites, &spb.SiteEdge{CallsiteId: cs.Id, CalleeIids: ids, Confidence: cs.DispatchConfidence})
+				ce.Sites = append(ce.Sites, &spb.SiteEdge{CallsiteId: cs.Id, CalleeIids: targetIDs, Confidence: resolverConf})
 			case cs.Kind == pb.CallSite_VIRTUAL && cs.Opaque:
 				ce.Sites = append(ce.Sites, &spb.SiteEdge{CallsiteId: cs.Id, OpaqueByCap: true, Confidence: 1.0})
 			}
@@ -860,7 +963,7 @@ func buildFunction(repo string, disp flow.Dispatcher, fn *ssa.Function, iidOf ma
 		Id:        &pb.Ident{Iid: iid, Bid: bid},
 		Fqn:       hash.FQN(fn),
 		Package:   hash.PackagePath(fn),
-		Origin:    originOf(hash.PackagePath(fn), repo),
+		Origin:    originOf(hash.PackagePath(fn), owner.Repo),
 		Generated: generatorOf(file) != pb.Generator_GEN_NONE,
 		Generator: generatorOf(file),
 		HasBody:   true,
@@ -874,7 +977,14 @@ func buildFunction(repo string, disp flow.Dispatcher, fn *ssa.Function, iidOf ma
 // build. Returns the Dispatcher flow consumes, the live resolver (nil on the
 // cached path), the opened store (nil when disabled/bypassed/nothing to
 // persist), the dispatch wall-clock, and the timing-line label.
-func resolveDispatch(o Options, ld *loader.Loaded, repo, mode string, iidOf map[*ssa.Function][]byte, emittable func(*ssa.Function) bool) (flow.Dispatcher, *callgraph.Resolver, *cgstore.Store, time.Duration, string) {
+func resolveDispatch(o Options, ld *loader.Loaded, repo, mode string, iidOf map[*ssa.Function][]byte, emittable func(*ssa.Function) bool, ext *callgraph.Externals) (flow.Dispatcher, *callgraph.Resolver, *cgstore.Store, time.Duration, string) {
+	// Dependency bodies change more than the call graph: a trivial protobuf
+	// getter in a dependency is read from its body, which moves call-site
+	// ordinals. So they are built before a snapshot is tried too. CHA and "off"
+	// do not look at bodies, and building them there only costs time.
+	if o.DepBodies && mode == "vta" {
+		ld.BuildDeps()
+	}
 	var store *cgstore.Store
 	if o.CgStoreDir != "" && o.CgStoreDir != "off" && mode != "off" {
 		switch {
@@ -913,7 +1023,7 @@ func resolveDispatch(o Options, ld *loader.Loaded, repo, mode string, iidOf map[
 					ByRefOut:   o.ByRefOut,
 					PbPaths:    o.PbPaths,
 				})
-				sr, err := callgraph.NewSnapshotResolver(snap.Meta, snap.Shards, byIID, skip)
+				sr, err := callgraph.NewSnapshotResolver(snap.Meta, snap.Shards, byIID, skip, ext)
 				if err != nil {
 					reason = err.Error()
 				} else {
@@ -925,10 +1035,16 @@ func resolveDispatch(o Options, ld *loader.Loaded, repo, mode string, iidOf map[
 			fmt.Fprintf(os.Stderr, "cgstore: %s — rebuilding\n", reason)
 		}
 	}
-	cg, tCG := loader.BuildCallGraph(ld.Prog, mode)
-	resolver := callgraph.NewResolver(cg, callgraph.DefaultFanoutCap, emittable)
+	cg, tCG, err := ld.CallGraph(mode)
+	resolver := callgraph.NewResolver(cg, callgraph.DefaultFanoutCap, emittable).WithExternals(ext)
 	if cg == nil {
-		store = nil // off mode or a recovered graph-build panic: nothing trustworthy to persist
+		store = nil // off mode or a failed graph build: nothing trustworthy to persist
+	}
+	if err != nil {
+		// Every interface and function-value call is now left without a
+		// target, as under --dispatch off. Say so where the label is read.
+		fmt.Fprintf(os.Stderr, "dispatch-warn: %v — dispatch is OFF for this run: interface and function-value calls have no targets\n", err)
+		return resolver, resolver, store, tCG, mode + "-FAILED"
 	}
 	return resolver, resolver, store, tCG, mode
 }
@@ -972,6 +1088,8 @@ func storeConfig(o Options, repo, mode string) (cgstore.Config, error) {
 		HTTPRoutes:         !o.NoHTTPRoutes,
 		HTTPCalls:          !o.NoHTTPCalls,
 		TopicCells:         !o.NoTopicCells,
+		DepImpls:           !o.NoDepImpls,
+		DepBodies:          o.DepBodies,
 		HTTPSeedRequest:    !o.NoHTTPRoutes && o.HTTPSeedRequest,
 		GoSumHash:          goSum,
 	}, nil
@@ -1030,6 +1148,7 @@ func canonicalFlow(fl *pb.LocalFlow) []byte {
 	clone := proto.Clone(fl).(*pb.LocalFlow)
 	for _, cs := range clone.Callsites {
 		cs.CalleeIids = nil
+		cs.TargetFqns = nil // names the same callees, so it is not body identity either
 		cs.Span = nil
 	}
 	for _, v := range clone.Vertices {

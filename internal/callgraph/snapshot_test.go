@@ -53,7 +53,7 @@ func snapshotFixture(t *testing.T) (site ssa.CallInstruction, fn *ssa.Function, 
 
 func TestSnapshotReplayMatchesLive(t *testing.T) {
 	site, _, want, meta, shards, byIID := snapshotFixture(t)
-	sr, err := NewSnapshotResolver(meta, shards, byIID, nil)
+	sr, err := NewSnapshotResolver(meta, shards, byIID, nil, nil)
 	if err != nil {
 		t.Fatalf("NewSnapshotResolver: %v", err)
 	}
@@ -103,13 +103,13 @@ func TestSnapshotValidationFailures(t *testing.T) {
 	}
 	for name, mutate := range mutations {
 		restore := mutate()
-		if _, err := NewSnapshotResolver(meta, shards, byIID, nil); err == nil {
+		if _, err := NewSnapshotResolver(meta, shards, byIID, nil, nil); err == nil {
 			t.Errorf("%s: expected validation error, got nil", name)
 		}
 		restore()
 	}
 	// sanity: restored snapshot validates again
-	if _, err := NewSnapshotResolver(meta, shards, byIID, nil); err != nil {
+	if _, err := NewSnapshotResolver(meta, shards, byIID, nil, nil); err != nil {
 		t.Fatalf("restored snapshot should validate: %v", err)
 	}
 }

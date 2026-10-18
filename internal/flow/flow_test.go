@@ -1,6 +1,7 @@
 package flow
 
 import (
+	"go/types"
 	"strings"
 	"testing"
 
@@ -497,6 +498,10 @@ func TestContainerWritesChanParamByRef(t *testing.T) {
 // port reaches the value's later uses. Returns whether an edge runs from the
 // arg port `port` of the call to `callee` to an arg port of `sink`.
 func writesBackToSink(res *Result, callee string, port uint32) bool {
+	return writesBackTo(res, callee, port, "libwrites.sink")
+}
+
+func writesBackTo(res *Result, callee string, port uint32, sinkSuffix string) bool {
 	vx := map[uint32]*pb.FlowVertex{}
 	for _, v := range res.Flow.Vertices {
 		vx[v.Id] = v
@@ -505,7 +510,7 @@ func writesBackToSink(res *Result, callee string, port uint32) bool {
 	for _, e := range res.Flow.Edges {
 		from, to := vx[e.From], vx[e.To]
 		if from.Kind == pb.VertexKind_CALL_ARG_PORT && from.Index == port && strings.HasSuffix(fqn(from), callee) &&
-			to.Kind == pb.VertexKind_CALL_ARG_PORT && strings.HasSuffix(fqn(to), "libwrites.sink") {
+			to.Kind == pb.VertexKind_CALL_ARG_PORT && strings.HasSuffix(fqn(to), sinkSuffix) {
 			return true
 		}
 	}
@@ -562,5 +567,52 @@ func TestLibraryWriteback(t *testing.T) {
 	// under --byref-out, is the mechanism there)
 	if writesBackToSink(build("example.com/libwrites.InScope", true), "libwrites.fill", 0) {
 		t.Error("InScope: an in-scope callee must not get a library write-back edge")
+	}
+}
+
+// fixedDispatcher answers every interface call with the same targets.
+type fixedDispatcher []*ssa.Function
+
+func (d fixedDispatcher) TargetsAt(site ssa.CallInstruction) ([]*ssa.Function, float32, bool) {
+	if !site.Common().IsInvoke() {
+		return nil, 1.0, false
+	}
+	return d, 1.0, false
+}
+
+// A dispatch target in a dependency module has no emitted body, so the call
+// is still a library call: the write-back edge stays. A target that is
+// emitted takes the edge away, as for a static call to an emitted function.
+func TestLibraryWritebackWithDependencyTarget(t *testing.T) {
+	ld, err := loader.Load("testdata/depdispatch", "./...", false, true, false, nil)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	var write *ssa.Function
+	if mset := ld.Prog.MethodSets.MethodSet(types.NewPointer(ld.Prog.ImportedPackage("strings").Pkg.Scope().Lookup("Builder").Type())); mset != nil {
+		for i := 0; i < mset.Len(); i++ {
+			if m := mset.At(i).Obj(); m.Name() == "Write" {
+				write = ld.Prog.FuncValue(m.(*types.Func))
+			}
+		}
+	}
+	if write == nil || len(write.Blocks) != 0 {
+		t.Fatalf("fixture drift: want the unbuilt (*strings.Builder).Write, got %v", write)
+	}
+	var call *ssa.Function
+	for f := range ssautil.AllFunctions(ld.Prog) {
+		if f.String() == "example.com/depdispatch.Call" {
+			call = f
+		}
+	}
+	opts := Opts{FieldPaths: true, ClosureFlow: true, LibraryWriteback: true}
+	res := Build(call, fixedDispatcher{write}, opts)
+	if !writesBackTo(res, "Write", 1, "depdispatch.sink") {
+		t.Error("a target without an emitted body must keep the write-back edge")
+	}
+	opts.Emittable = func(*ssa.Function) bool { return true }
+	res = Build(call, fixedDispatcher{write}, opts)
+	if writesBackTo(res, "Write", 1, "depdispatch.sink") {
+		t.Error("an emitted target must not get a write-back edge")
 	}
 }

@@ -1,6 +1,7 @@
 // Package hash computes the two-level content addresses (doc 03 §2).
-//   iid = sha256(repo, package_path, exported_symbol_path, normalized_signature)
-//   bid = sha256(canonical LocalFlow) embedding callees' iids (NOT bids)
+//
+//	iid = sha256(owner module, package_path, exported_symbol_path, normalized_signature)
+//	bid = sha256(canonical LocalFlow) embedding callees' iids (NOT bids)
 package hash
 
 import (
@@ -49,16 +50,40 @@ func ContractIID(fullName string) []byte {
 	return IIDFromParts("", "", fullName, "grpc")
 }
 
+// Owner picks the first iid field for a function. That field is the module
+// that declares the function's package, so the iid of a library function is the
+// same in the library's own extraction and in the extraction of any module that
+// calls it. A package with no module (the standard library, GOPATH) is owned by
+// the extracted repo, as is a function with no package at all.
+type Owner struct {
+	Repo    string            // the extracted module, or the directory name when there is none
+	Modules map[string]string // package path -> module path, over every loaded package
+}
+
+// Of returns the owner of fn. The module path is the one in the declaring
+// module's go.mod, also when a replace directive points it at another place.
+func (o Owner) Of(fn *ssa.Function) string {
+	if m := o.Modules[PackagePath(fn)]; m != "" {
+		return m
+	}
+	return o.Repo
+}
+
+// IID is the iid of fn under its owner.
+func (o Owner) IID(fn *ssa.Function) []byte {
+	return IID(o.Of(fn), fn)
+}
+
 // IID is signature identity: stable across body edits. A generic instance's
 // signature part is SignatureString — no parameter names, no alias spelling —
 // because ssa shares one signature object among all identical instantiated
 // signatures (CanonicalInstances).
-func IID(repo string, fn *ssa.Function) []byte {
+func IID(owner string, fn *ssa.Function) []byte {
 	if canonical(fn) {
-		return IIDFromParts(repo, PackagePath(fn), instanceFQN(fn), SignatureString(fn.Signature))
+		return IIDFromParts(owner, PackagePath(fn), instanceFQN(fn), SignatureString(fn.Signature))
 	}
 	h := sha256.New()
-	writeField(h, []byte(repo))
+	writeField(h, []byte(owner))
 	writeField(h, []byte(PackagePath(fn)))
 	writeField(h, []byte(FQN(fn)))
 	writeField(h, []byte(fn.Signature.String()))

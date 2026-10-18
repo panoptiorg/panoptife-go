@@ -23,7 +23,7 @@ One `.pb` file per Go package that has at least one emitted function or
 contract, named after the package path with `/`, `\` and `:` replaced by `_`
 (`example.com_backend_app.pb`). Each file is a deterministic binary
 `CgfPackage` message from [proto/cgf.proto](../proto/cgf.proto) with
-`language = "go"` and `schema_version = 2`. `commit_sha` is the `HEAD` of the
+`language = "go"` and `schema_version = 3`. `commit_sha` is the `HEAD` of the
 git repository containing the module, or empty outside git. `Span.file` is
 relative to the directory given to `pc-fe build`, with `/` separators, so the
 same checkout gives the same CGF wherever it sits on disk; a file outside that
@@ -93,6 +93,8 @@ Call graph:
 |---|---|---|
 | `--dispatch` | `vta` | `vta` (variable type analysis, precise, whole-program), `cha` (class hierarchy analysis, faster, more targets), or `off` (no call graph: interface and function-value calls get no targets) |
 | `--cgstore` | empty | directory for call-graph snapshots. Empty or `off` disables it. See [extraction.md](extraction.md#call-graph-cache-cgstore) |
+| `--dep-impls` | `true` | an interface call that dispatch cannot resolve gets the methods that dependency modules declare for it, when there are 1 to 10 of them (not for an interface of the standard library). `=false` restores the previous emission: such a call has no target. Part of the cgstore key. See [extraction.md](extraction.md#targets-in-dependency-modules) |
+| `--dep-bodies` | `false` | build the SSA bodies of dependency packages before the call graph, so VTA sees flows that run through them. The emitted functions stay the same. About double the SSA and call-graph time. Part of the cgstore key. See [extraction.md](extraction.md#targets-in-dependency-modules) |
 
 Value-flow emission. Defaults reproduce the CGF the core's tests expect;
 every one of these changes the CGF bytes and is part of the cgstore key.

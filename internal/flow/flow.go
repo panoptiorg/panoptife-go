@@ -42,7 +42,7 @@ import (
 type Callee struct {
 	FQN            string
 	Static         *ssa.Function   // resolved static callee, or nil
-	Targets        []*ssa.Function // VTA targets for virtual dispatch
+	Targets        []*ssa.Function // VTA targets for virtual dispatch; may include functions of dependency modules (no emitted body)
 	Kind           pb.CallSite_Kind
 	RemoteFullName string // for INVOKES_REMOTE: "pkg.Service/Method"
 }
@@ -73,6 +73,10 @@ type Result struct {
 	// CappedSites: a function-value or builtin call gets cs.Opaque=true, an
 	// interface call does not. Census-only.
 	UnresolvedDynamicSites int
+	// DepImplSites is the count of interface-call sites whose targets are the
+	// declared implementations in dependency modules (see callgraph.Resolver).
+	// Census-only. Zero for a Dispatcher that does not report it.
+	DepImplSites int
 	// HTTPCalls is the §2.3 census of this function's synthetic client sites.
 	HTTPCalls HTTPCallCensus
 	// Topics is the §2.4 census of this function's topic produces/consumes.
@@ -102,6 +106,12 @@ func (c *HTTPCallCensus) Add(o HTTPCallCensus) {
 // must treat a nil receiver / nil site as "resolves nothing".
 type Dispatcher interface {
 	TargetsAt(site ssa.CallInstruction) (targets []*ssa.Function, confidence float32, cappedOpaque bool)
+}
+
+// depImplReporter is implemented by a Dispatcher that can say which sites got
+// their targets from the declared-implementations rule.
+type depImplReporter interface {
+	DepImplSite(site ssa.CallInstruction) bool
 }
 
 // Opts selects the emission features. Every field is an escape-hatch flag whose
@@ -247,6 +257,7 @@ type builder struct {
 	// Result.UnresolvedDynamicSites.
 	nCapped     int
 	nUnresolved int
+	nDepImpl    int
 
 	// §2.1 surface reads and §2.3 client calls, in fn.Blocks/Instrs order:
 	// their synthetic sites are appended after the closure bindings, for the
@@ -352,6 +363,7 @@ func Build(fn *ssa.Function, res Dispatcher, o Opts) *Result {
 		NCallInstrs:            b.nCallInstrs,
 		CappedSites:            b.nCapped,
 		UnresolvedDynamicSites: b.nUnresolved,
+		DepImplSites:           b.nDepImpl,
 		HTTPCalls:              b.httpC,
 		Topics:                 b.topicC,
 	}
@@ -716,6 +728,10 @@ func (b *builder) handleCall(instr ssa.CallInstruction, kind pb.CallSite_Kind) {
 				b.nCapped++
 			case len(targets) == 0:
 				b.nUnresolved++
+			default:
+				if r, ok := b.res.(depImplReporter); ok && r.DepImplSite(instr) {
+					b.nDepImpl++
+				}
 			}
 		}
 	} else {
@@ -752,7 +768,15 @@ func (b *builder) handleCall(instr ssa.CallInstruction, kind pb.CallSite_Kind) {
 		if callee.Static != nil {
 			library = !b.emittable(callee.Static)
 		} else {
-			library = len(callee.Targets) == 0
+			// Targets in a dependency module have no emitted body either, so
+			// only an emittable target makes the call a non-library call.
+			library = true
+			for _, t := range callee.Targets {
+				if b.emittable(t) {
+					library = false
+					break
+				}
+			}
 		}
 	}
 

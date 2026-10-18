@@ -552,6 +552,10 @@ func (x *CgfPackage) GetHttpRoutes() []*HttpRoute {
 //	iid: stable across body edits.
 //	  Go:         hash(repo, package_path, fqn, signature)
 //	  TypeScript: hash(repo, directory, "file:symbol", "ts")
+//	A call site's callee iid equals the iid that the declaring code's own
+//	  extraction emits. Go: the first iid field is the module that declares
+//	  the function's package (the extraction repo for packages with no
+//	  module, such as the standard library).
 //	bid = hash(LocalFlow) embedding callees' iids (NOT bids). Go hashes a
 //	  deterministic protobuf encoding without spans or field names;
 //	  TypeScript hashes a JSON encoding, spans included.
@@ -611,10 +615,12 @@ func (x *Ident) GetBid() []byte {
 }
 
 type Span struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	File          string                 `protobuf:"bytes,1,opt,name=file,proto3" json:"file,omitempty"`
-	Line          int32                  `protobuf:"varint,2,opt,name=line,proto3" json:"line,omitempty"`
-	Col           int32                  `protobuf:"varint,3,opt,name=col,proto3" json:"col,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Path relative to the directory the frontend was run on, "/"-separated;
+	// a file outside that directory keeps its absolute path.
+	File          string `protobuf:"bytes,1,opt,name=file,proto3" json:"file,omitempty"`
+	Line          int32  `protobuf:"varint,2,opt,name=line,proto3" json:"line,omitempty"`
+	Col           int32  `protobuf:"varint,3,opt,name=col,proto3" json:"col,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1396,7 +1402,7 @@ type CallSite struct {
 	Arg0IsReceiver     bool              `protobuf:"varint,7,opt,name=arg0_is_receiver,json=arg0IsReceiver,proto3" json:"arg0_is_receiver,omitempty"`
 	Resultc            uint32            `protobuf:"varint,8,opt,name=resultc,proto3" json:"resultc,omitempty"` // result-port vertices for 0..resultc-1
 	Span               *Span             `protobuf:"bytes,9,opt,name=span,proto3" json:"span,omitempty"`
-	DispatchConfidence float32           `protobuf:"fixed32,10,opt,name=dispatch_confidence,json=dispatchConfidence,proto3" json:"dispatch_confidence,omitempty"` // 1/n for n dispatch targets (2..fan-out cap); else 1.0
+	DispatchConfidence float32           `protobuf:"fixed32,10,opt,name=dispatch_confidence,json=dispatchConfidence,proto3" json:"dispatch_confidence,omitempty"` // 1/n for n callee_iids (2..fan-out cap); else 1.0
 	StreamOp           CallSite_StreamOp `protobuf:"varint,11,opt,name=stream_op,json=streamOp,proto3,enum=panopticode.cgf.CallSite_StreamOp" json:"stream_op,omitempty"`
 	StreamClientSide   bool              `protobuf:"varint,12,opt,name=stream_client_side,json=streamClientSide,proto3" json:"stream_client_side,omitempty"` // true: op on Svc_MClient; false: on Svc_MServer
 	// Bit j set = result j is `error`-typed (types.Implements, so concrete
@@ -1419,7 +1425,15 @@ type CallSite struct {
 	// data-bearing argument of the real request call flowing into arg port 0).
 	// Unlinked, such a site is inert. The core links it to an HttpRoute by
 	// method + canonical path at load time and turns it into INVOKES_REMOTE.
-	HttpCall      *HttpCall `protobuf:"bytes,15,opt,name=http_call,json=httpCall,proto3" json:"http_call,omitempty"`
+	HttpCall *HttpCall `protobuf:"bytes,15,opt,name=http_call,json=httpCall,proto3" json:"http_call,omitempty"`
+	// Set when callee_iids come from dispatch targets (VIRTUAL or a func-value
+	// call): target_fqns[i] is the fqn of the function whose iid is
+	// callee_iids[i]. Empty otherwise. A consumer can name a target in another
+	// module without that module's CGF. When a site has a target in another
+	// module, the last entry is the unresolved one (iid from callee_fqn, name
+	// callee_fqn): the targets cannot be all the code that can run there, so the
+	// core still applies its default leaf next to the summaries it finds.
+	TargetFqns    []string `protobuf:"bytes,16,rep,name=target_fqns,json=targetFqns,proto3" json:"target_fqns,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1555,6 +1569,13 @@ func (x *CallSite) GetArgNames() []string {
 func (x *CallSite) GetHttpCall() *HttpCall {
 	if x != nil {
 		return x.HttpCall
+	}
+	return nil
+}
+
+func (x *CallSite) GetTargetFqns() []string {
+	if x != nil {
+		return x.TargetFqns
 	}
 	return nil
 }
@@ -2279,7 +2300,7 @@ const file_cgf_proto_rawDesc = "" +
 	"\bFlowEdge\x12\x12\n" +
 	"\x04from\x18\x01 \x01(\rR\x04from\x12\x0e\n" +
 	"\x02to\x18\x02 \x01(\rR\x02to\x12\x1b\n" +
-	"\tvia_alias\x18\x03 \x01(\bR\bviaAlias\"\xe0\x05\n" +
+	"\tvia_alias\x18\x03 \x01(\bR\bviaAlias\"\x81\x06\n" +
 	"\bCallSite\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\rR\x02id\x122\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x1e.panopticode.cgf.CallSite.KindR\x04kind\x12\x1f\n" +
@@ -2298,7 +2319,9 @@ const file_cgf_proto_rawDesc = "" +
 	"\x12stream_client_side\x18\f \x01(\bR\x10streamClientSide\x12#\n" +
 	"\rerror_results\x18\r \x01(\x04R\ferrorResults\x12\x1b\n" +
 	"\targ_names\x18\x0e \x03(\tR\bargNames\x126\n" +
-	"\thttp_call\x18\x0f \x01(\v2\x19.panopticode.cgf.HttpCallR\bhttpCall\"S\n" +
+	"\thttp_call\x18\x0f \x01(\v2\x19.panopticode.cgf.HttpCallR\bhttpCall\x12\x1f\n" +
+	"\vtarget_fqns\x18\x10 \x03(\tR\n" +
+	"targetFqns\"S\n" +
 	"\x04Kind\x12\n" +
 	"\n" +
 	"\x06STATIC\x10\x00\x12\v\n" +

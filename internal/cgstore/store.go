@@ -25,7 +25,9 @@ import (
 // v2: W1d closure-binding CallSites. n_callsites now counts only the sites
 // backed by a real ssa.CallInstruction (flow.Result.NCallInstrs), so a v1
 // snapshot's count means something different and must never be replayed.
-const SchemaVersion = 2
+// v3: stored callee iids can name a function in a dependency module, which
+// has no emitted body, so a v2 reader would reject the snapshot.
+const SchemaVersion = 3
 
 // keepCommits bounds snapshots retained per namespace (GC keeps the newest N).
 const keepCommits = 8
@@ -101,7 +103,12 @@ type Config struct {
 	HTTPRoutes      bool
 	HTTPSeedRequest bool
 	TopicCells      bool
-	GoSumHash       string // hex sha256 of the repo's go.sum ("" if none)
+	// DepImpls / DepBodies: dependency dispatch (--dep-impls=false turns DepImpls
+	// off, --dep-bodies turns DepBodies on). Both decide which targets a site
+	// stores, so each setting has its own namespace.
+	DepImpls  bool
+	DepBodies bool
+	GoSumHash string // hex sha256 of the repo's go.sum ("" if none)
 }
 
 // Key hashes the config sha256 length-prefixed (same discipline as hash.IID —
@@ -119,6 +126,7 @@ func (c Config) Key() []byte {
 		fmt.Sprintf("%t", c.SurfaceReads), fmt.Sprintf("%t", c.HTTPRoutes), fmt.Sprintf("%t", c.HTTPCalls),
 		fmt.Sprintf("%t", c.CanonicalInstances),
 		fmt.Sprintf("%t", c.TopicCells), fmt.Sprintf("%t", c.HTTPSeedRequest),
+		fmt.Sprintf("%t", c.DepImpls), fmt.Sprintf("%t", c.DepBodies),
 		c.PbPaths, c.MockPaths, c.GoSumHash, fmt.Sprintf("%d", SchemaVersion),
 	} {
 		writeField(h, f)

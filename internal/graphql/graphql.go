@@ -63,7 +63,7 @@ type dispatch struct {
 
 // Extract scans in-scope packages for gqlgen ResolverRoot interfaces and
 // returns all schema-field bindings whose resolver impl is in scope.
-func Extract(prog *ssa.Program, inScope map[*ssa.Package]bool, repo string) []Field {
+func Extract(prog *ssa.Program, inScope map[*ssa.Package]bool, owner hash.Owner) []Field {
 	var out []Field
 	seen := map[string]bool{}
 	warned := map[string]bool{}
@@ -87,7 +87,7 @@ func Extract(prog *ssa.Program, inScope map[*ssa.Package]bool, repo string) []Fi
 		// dispatchers in this same exec package.
 		disp := scanDispatchers(prog, sp.Pkg, ifaces)
 		for typeName, iface := range ifaces {
-			for _, f := range bindField(prog, inScope, repo, typeName, iface, disp, warned) {
+			for _, f := range bindField(prog, inScope, owner, typeName, iface, disp, warned) {
 				key := f.TypeField + "|" + hash.FQN(f.ResolverFn)
 				if seen[key] {
 					continue
@@ -285,7 +285,7 @@ func mapArgName(v ssa.Value) (string, bool) {
 // types.Implements finds it without reading the generated dispatch (extra
 // impls, if any, are seeded too — over-approximation in the safe direction).
 // The generated dispatch is consulted only for the SDL names.
-func bindField(prog *ssa.Program, inScope map[*ssa.Package]bool, repo, typeName string,
+func bindField(prog *ssa.Program, inScope map[*ssa.Package]bool, owner hash.Owner, typeName string,
 	iface *types.Interface, disp map[string]dispatch, warned map[string]bool) []Field {
 	var out []Field
 	for ip := range inScope {
@@ -342,7 +342,7 @@ func bindField(prog *ssa.Program, inScope map[*ssa.Package]bool, repo, typeName 
 					TypeField:   tf,
 					FieldIID:    hash.ContractIID("graphql:" + tf),
 					ResolverFn:  ssaFn,
-					ResolverIID: hash.IID(repo, ssaFn),
+					ResolverIID: owner.IID(ssaFn),
 					ArgParamIdx: argIdx,
 					Args:        args,
 				})
