@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0](https://github.com/panoptiorg/panoptife-go/compare/v0.2.0...v0.3.0) (2026-10-18)
+
+
+### Features
+
+* --version on pc-fe (also -version), -version on cgfdump and cgfstat ([b2ddff1](https://github.com/panoptiorg/panoptife-go/commit/b2ddff14f3247839fa18b15264f414ba2aab80d0))
+* a load-warn line names packages with type errors that are left out of the CGF ([b2ddff1](https://github.com/panoptiorg/panoptife-go/commit/b2ddff14f3247839fa18b15264f414ba2aab80d0))
+* span paths are relative to the extracted directory, so one checkout gives the same CGF anywhere ([b2ddff1](https://github.com/panoptiorg/panoptife-go/commit/b2ddff14f3247839fa18b15264f414ba2aab80d0))
+
+
+### Bug Fixes
+
+* callee iids across modules; interface targets in dependencies ([#7](https://github.com/panoptiorg/panoptife-go/issues/7)) ([ed09f02](https://github.com/panoptiorg/panoptife-go/commit/ed09f02d93ba42213712abbd2e5b982d55fedf2f))
+* cgfdump --help no longer panics and cgfstat --help prints the usage ([b2ddff1](https://github.com/panoptiorg/panoptife-go/commit/b2ddff14f3247839fa18b15264f414ba2aab80d0))
+* clear errors for a missing directory, a file, a directory outside a Go module and a scope that matches nothing; usage errors exit 2 ([b2ddff1](https://github.com/panoptiorg/panoptife-go/commit/b2ddff14f3247839fa18b15264f414ba2aab80d0))
+* detect mock files by their generator header ([#8](https://github.com/panoptiorg/panoptife-go/issues/8)) ([d3d449f](https://github.com/panoptiorg/panoptife-go/commit/d3d449f343dfd1214b90a66528df9dc59eea9ae9))
+
 ## [0.2.0](https://github.com/panoptiorg/panoptife-go/compare/v0.1.0...v0.2.0) (2026-10-08)
 
 
