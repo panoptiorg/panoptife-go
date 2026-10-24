@@ -1,4 +1,5 @@
 bin/
 out/
+dist/
 *.pb.bin
 .DS_Store
