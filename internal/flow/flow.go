@@ -1758,10 +1758,20 @@ func CanonicalizedCallFilter(o Opts) func(ssa.CallInstruction) bool {
 	}
 }
 
-// trivialPbGetter recognizes `x.GetFoo()` on a pb-package struct whose SSA
-// body is verifiably `return x.Foo` (modulo the generated nil-check). The SSA
-// body check is the misclassification guard: a hand-written GetX with logic
-// keeps its barrier, so its sinks/summaries are never skipped.
+// trivialPbGetter recognizes `x.GetFoo()` on a pb-package struct that is a
+// projection of field Foo, by one of two proofs:
+//
+//   - the SSA body is verifiably `return x.Foo` (modulo the generated
+//     nil-check) — the body check is the misclassification guard: a
+//     hand-written GetX with logic keeps its barrier, so its sinks/summaries
+//     are never skipped;
+//   - the body does not exist (the getter's package is outside `--scope`, e.g.
+//     a rule that drops every /pb/ package): then the receiver struct must be
+//     generated protobuf output (generatedPbMessage) and the method's result
+//     type must be identical to the field's own type. A generated oneof getter
+//     qualifies too: its field is the oneof's wrapper interface and the getter
+//     returns that same interface, so type identity holds. Any getter that
+//     fails identity keeps its barrier.
 func trivialPbGetter(cc *ssa.CallCommon, pbp pkgclass.PbPaths) (uint32, string, bool) {
 	if cc.IsInvoke() {
 		return 0, "", false
@@ -1792,16 +1802,84 @@ func trivialPbGetter(cc *ssa.CallCommon, pbp pkgclass.PbPaths) (uint32, string, 
 			break
 		}
 	}
-	if fieldIdx < 0 || !getterReturnsField(sc, fieldIdx) {
+	if fieldIdx < 0 {
 		return 0, "", false
+	}
+	if !getterReturnsField(sc, fieldIdx) {
+		// A body that exists and does anything but `return x.Foo` keeps its
+		// barrier. A bodiless getter (out-of-scope pb package) is proven a
+		// projection from go/types instead: generated message + identical
+		// result and field types (see the doc comment above).
+		if len(sc.Blocks) != 0 || !generatedPbMessage(st, named) ||
+			!types.Identical(st.Field(fieldIdx).Type(), sc.Signature.Results().At(0).Type()) {
+			return 0, "", false
+		}
 	}
 	fid, fname := fieldID(st, fieldIdx)
 	return fid, fname, true
 }
 
+// Packages the two markers of generated protobuf output live in. Marker
+// packages, not dependencies: the check compares paths only.
+const (
+	protoimplPkgPath    = "google.golang.org/protobuf/runtime/protoimpl"
+	protoreflectPkgPath = "google.golang.org/protobuf/reflect/protoreflect"
+)
+
+// generatedPbMessage reports whether st (the receiver struct of a bodiless
+// getter) is protoc-gen-go output. Two markers, either suffices: the
+// `state protoimpl.MessageState` field every modern generated message embeds,
+// or a `ProtoReflect() protoreflect.Message` method — the single method of
+// protoreflect.ProtoMessage, checked on the pointer's method set because the
+// generated method has a pointer receiver (promoted methods from an embedded
+// base count too).
+func generatedPbMessage(st *types.Struct, named *types.Named) bool {
+	for i := 0; i < st.NumFields(); i++ {
+		f := st.Field(i)
+		if f.Name() != "state" {
+			continue
+		}
+		if isNamedFrom(f.Type(), "MessageState", protoimplPkgPath) {
+			return true
+		}
+	}
+	ms := types.NewMethodSet(types.NewPointer(named))
+	for i := 0; i < ms.Len(); i++ {
+		fn, ok := ms.At(i).Obj().(*types.Func)
+		if !ok || fn.Name() != "ProtoReflect" {
+			continue
+		}
+		sig, ok := fn.Type().(*types.Signature)
+		if !ok || sig.Params().Len() != 0 || sig.Results().Len() != 1 {
+			continue
+		}
+		if isNamedFrom(sig.Results().At(0).Type(), "Message", protoreflectPkgPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// isNamedFrom reports whether t resolves to the type `name` declared in
+// pkgPath. protoc-gen-go declares its runtime helpers as aliases
+// (`type MessageState = impl.MessageState`), so both the alias's own object
+// and the unaliased target count.
+func isNamedFrom(t types.Type, name, pkgPath string) bool {
+	if a, ok := t.(*types.Alias); ok && objIs(a.Obj(), name, pkgPath) {
+		return true
+	}
+	nt, ok := types.Unalias(t).(*types.Named)
+	return ok && objIs(nt.Obj(), name, pkgPath)
+}
+
+func objIs(obj types.Object, name, pkgPath string) bool {
+	return obj != nil && obj.Name() == name && obj.Pkg() != nil && obj.Pkg().Path() == pkgPath
+}
+
 // getterReturnsField verifies every return in sc's body yields either a
 // constant (the generated nil-check's zero branch) or recv.<fieldIdx>, and no
-// calls occur. Bodiless (unbuilt/external) getters fail — barrier stays.
+// calls occur. A bodiless getter fails here; trivialPbGetter then decides it
+// from go/types.
 func getterReturnsField(sc *ssa.Function, fieldIdx int) bool {
 	if len(sc.Blocks) == 0 || len(sc.Params) != 1 {
 		return false
