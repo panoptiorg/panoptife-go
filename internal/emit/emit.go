@@ -370,6 +370,7 @@ func Run(o Options) error {
 	fo.Paths = relpath.New(o.RepoDir)
 	fo.Emittable = emittable
 	fo.RemoteClients = flow.BuildRemoteClientIndex(ld.Prog, o.PbPaths)
+	fo.VarInits = flow.BuildVarInitIndex(ld.Prog)
 	if fo.TopicCells {
 		fo.Topics = flow.BuildTopicIndex(ld.Prog, fns)
 	}

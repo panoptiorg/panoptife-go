@@ -67,6 +67,8 @@ jobs:
           cache: false
 
       - name: build
+        # dist/ is in .gitignore: writing into the checkout must not make the
+        # tree dirty, or go build stamps every binary vX.Y.Z+dirty.
         run: |
           version=${TAG#v}
           for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
