@@ -269,9 +269,17 @@ vertex, so `req.Number` and `req.Name` are distinct; longer paths are
 truncated to their first two fields, which over-approximates. For generated
 protobuf structs a field is identified by its proto field number, otherwise
 by its index. Trivial generated getters (`req.GetNumber()`) in `--pb-paths`
-packages that are in `--scope` (the getter's body must be built) become
-field projections and their call sites disappear. Nullable
-wrapper types are transparent to field paths: `database/sql` `Null*`,
+packages become field projections and their call sites disappear. The proof
+is the getter's SSA body when it is built (`--scope` covers the package):
+every return must yield the field, and a body with anything else keeps its
+call site. A body that does not exist (the common `--scope` rule that drops
+every `/pb/` package) gets the same treatment when go/types alone proves it:
+the receiver struct must be generated protobuf output — it embeds the
+`protoimpl.MessageState` field or has the `ProtoReflect() protoreflect.Message`
+method — and the getter's result type must be identical to the same-named
+field's type. The identity check covers oneof getters (the field and the
+result are the oneof's wrapper interface) and keeps everything else's barrier.
+Nullable wrapper types are transparent to field paths: `database/sql` `Null*`,
 `guregu/null`, `volatiletech/null`, sqlboiler `types/null` and `wrapperspb`.
 
 Closures (`--closure-flow`, on): free variables become `IN_PARAM` vertices
@@ -700,6 +708,7 @@ fallbacks on purpose.
 | `downstream` | the last service in the `federation` → `backend` → `downstream` chain; runs SQL |
 | `dispatch` | interface calls with 2 targets and with 12 (over the fan-out cap) |
 | `fieldpath` | field paths keeping disjoint request fields apart |
+| `pbgetter` | getters of a `--pb-paths` package left out of `--scope`: canonicalized from go/types, with non-generated and type-mismatched getters kept as call sites |
 | `closureflow` | closure free variables |
 | `mockheaders` | mocks found by generator header: mockgen, mockery and minimock files with ordinary names inside a real package, a package of only mockgen output, and the cases that must not match (a protoc header, a comment below the `package` clause, a package named `mockingbird`) |
 | `wrappers` | method values, method expressions and promoted methods |
