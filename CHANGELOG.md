@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3](https://github.com/panoptiorg/panoptife-go/compare/v0.3.2...v0.3.3) (2026-10-24)
+
+
+### Bug Fixes
+
+* keep a zero-arg shell call site for canonicalized pb getters ([#13](https://github.com/panoptiorg/panoptife-go/issues/13)) ([7ef9c0b](https://github.com/panoptiorg/panoptife-go/commit/7ef9c0b2463327672b2d6e3d9c912e64674db18c))
+
 ## [0.3.2](https://github.com/panoptiorg/panoptife-go/compare/v0.3.1...v0.3.2) (2026-10-24)
 
 
