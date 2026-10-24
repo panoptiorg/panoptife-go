@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/panoptiorg/panoptife-go/compare/v0.3.1...v0.3.2) (2026-10-24)
+
+
+### Bug Fixes
+
+* canonicalize trivial pb getters without an SSA body ([#11](https://github.com/panoptiorg/panoptife-go/issues/11)) ([b55e742](https://github.com/panoptiorg/panoptife-go/commit/b55e742f02747575056a1e83578bd5ca35d9429b))
+
 ## [0.3.1](https://github.com/panoptiorg/panoptife-go/compare/v0.3.0...v0.3.1) (2026-10-24)
 
 
