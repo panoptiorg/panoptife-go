@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/panoptiorg/panoptife-go/compare/v0.3.0...v0.3.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* clean release version stamp; static calls through once-bound package variables ([#9](https://github.com/panoptiorg/panoptife-go/issues/9)) ([e3587ff](https://github.com/panoptiorg/panoptife-go/commit/e3587ff9a6ec61050d7fc83bbb414b5da28bf813))
+
 ## [0.3.0](https://github.com/panoptiorg/panoptife-go/compare/v0.2.0...v0.3.0) (2026-10-18)
 
 
