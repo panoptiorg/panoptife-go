@@ -446,16 +446,23 @@ func TestDepBodiesKeepsDispatchOnRealDependencies(t *testing.T) {
 
 // Dependency bodies change the CGF beyond the call graph: a getter in a
 // dependency package is a field read once its body is built, so its call site
-// goes away. A snapshot is replayed against the same build, so a replay under
-// --dep-bodies hits the cache and gives the live bytes.
+// loses its arg ports (canonicalized to the zero-arg shell). A snapshot is
+// replayed against the same build, so a replay under --dep-bodies hits the
+// cache and gives the live bytes.
 func TestCgstoreReplayWithDepBodies(t *testing.T) {
 	app := xmodRepo(t)
-	handlerSites := func(pkgs map[string]*pb.CgfPackage) int {
+	handlerArgc := func(pkgs map[string]*pb.CgfPackage) (total uint32, shells int) {
 		f := fnByFqn(pkgs, pkgApp+".pbHandler")
 		if f == nil {
 			t.Fatal("pbHandler not emitted")
 		}
-		return len(f.Flow.Callsites)
+		for _, cs := range f.Flow.Callsites {
+			total += cs.Argc
+			if cs.Argc == 0 {
+				shells++
+			}
+		}
+		return total, shells
 	}
 	plain, _ := runCGF(t, Options{RepoDir: app})
 	o := Options{RepoDir: app, CgStoreDir: t.TempDir(), DepBodies: true}
@@ -463,8 +470,10 @@ func TestCgstoreReplayWithDepBodies(t *testing.T) {
 	if !strings.Contains(liveErr, "dispatch[vta]") {
 		t.Fatalf("first run should build the graph live:\n%s", liveErr)
 	}
-	if handlerSites(live) >= handlerSites(plain) {
-		t.Fatalf("fixture drift: the getter call site must go away with the dependency body (%d sites with, %d without)", handlerSites(live), handlerSites(plain))
+	plainArgc, _ := handlerArgc(plain)
+	liveArgc, liveShells := handlerArgc(live)
+	if liveArgc >= plainArgc || liveShells == 0 {
+		t.Fatalf("fixture drift: the getter call site must lose its arg ports with the dependency body (%d argc, %d shells with; %d without)", liveArgc, liveShells, plainArgc)
 	}
 	replay, replayErr := runCGF(t, o)
 	if !strings.Contains(replayErr, "dispatch[vta-cached]") || strings.Contains(replayErr, "rebuilding") {

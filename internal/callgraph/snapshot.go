@@ -46,10 +46,11 @@ type snapEntry struct {
 //     function set drifted under the store key.
 //
 // skipCall (nil = keep all) drops CallInstructions that emit no CallSite —
-// with field paths on, flow canonicalizes trivial pb getters, so the ordinal
-// enumeration must apply the same filter (emit passes flow.IsCanonicalizedCall
-// when meta.FieldPaths; the flag is also in the store key, so a snapshot is
-// only ever replayed under the mode that captured it).
+// the `copy` builtin under heap slots is the only one (a canonicalized pb
+// getter keeps a zero-arg shell CallSite), and emit hands the filter here so
+// the ordinal enumeration matches what emission counted. The flags are also
+// in the store key, so a snapshot is only ever replayed under the mode that
+// captured it.
 func NewSnapshotResolver(meta *pb.Meta, shards map[string]*pb.PkgShard, fnByIID map[string]*ssa.Function, skipCall func(ssa.CallInstruction) bool, ext *Externals) (*SnapshotResolver, error) {
 	r := &SnapshotResolver{
 		sites:            map[ssa.CallInstruction]snapEntry{},

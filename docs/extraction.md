@@ -269,16 +269,29 @@ vertex, so `req.Number` and `req.Name` are distinct; longer paths are
 truncated to their first two fields, which over-approximates. For generated
 protobuf structs a field is identified by its proto field number, otherwise
 by its index. Trivial generated getters (`req.GetNumber()`) in `--pb-paths`
-packages become field projections and their call sites disappear. The proof
+packages become field projections, and their call sites lose their argument
+ports. The proof
 is the getter's SSA body when it is built (`--scope` covers the package):
 every return must yield the field, and a body with anything else keeps its
-call site. A body that does not exist (the common `--scope` rule that drops
+full call site. A body that does not exist (the common `--scope` rule that drops
 every `/pb/` package) gets the same treatment when go/types alone proves it:
 the receiver struct must be generated protobuf output — it embeds the
 `protoimpl.MessageState` field or has the `ProtoReflect() protoreflect.Message`
 method — and the getter's result type must be identical to the same-named
 field's type. The identity check covers oneof getters (the field and the
 result are the oneof's wrapper interface) and keeps everything else's barrier.
+
+A canonicalized getter keeps a zero-arg shell call site: the real
+`callee_fqn` and one result port, with no argument ports — the receiver is
+not an argument of the projection, so the core's default leaf cannot smear
+whole-object taint through it, while a catalog `[[sources]]` rule still
+matches the getter by name and seeds the projected field. Dropping the call
+site entirely (the earlier emission) made every getter rule inert under
+field paths: a projection's vertices cannot tell which getter — or whether
+one — was called, and sourcing a plain `req.Number` read from its type's
+name would fire the rules on in-scope structs that merely share the
+type-name shape. A plain field read therefore carries no call site and is
+not sourced.
 Nullable wrapper types are transparent to field paths: `database/sql` `Null*`,
 `guregu/null`, `volatiletech/null`, sqlboiler `types/null` and `wrapperspb`.
 
@@ -709,6 +722,7 @@ fallbacks on purpose.
 | `dispatch` | interface calls with 2 targets and with 12 (over the fan-out cap) |
 | `fieldpath` | field paths keeping disjoint request fields apart |
 | `pbgetter` | getters of a `--pb-paths` package left out of `--scope`: canonicalized from go/types, with non-generated and type-mismatched getters kept as call sites |
+| `xgrpc` | two services sharing one proto: a canonicalized getter's zero-arg shell call site carries the catalog source across the gRPC contract field-precisely; the clean field stays clean, and a helper that only receives the request is sourced by the getter rule |
 | `closureflow` | closure free variables |
 | `mockheaders` | mocks found by generator header: mockgen, mockery and minimock files with ordinary names inside a real package, a package of only mockgen output, and the cases that must not match (a protoc header, a comment below the `package` clause, a package named `mockingbird`) |
 | `wrappers` | method values, method expressions and promoted methods |
