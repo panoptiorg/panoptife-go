@@ -212,6 +212,12 @@ type Opts struct {
 	// name-convention detector only. Not part of any cache key: extract_key
 	// hashes the binary, so a detector change invalidates by construction.
 	RemoteClients *RemoteClientIndex
+	// VarInits resolves package-level function variables that their package
+	// initializer binds exactly once to a static function, so a call through
+	// such a variable is emitted as a static call to it (see VarInitIndex).
+	// nil: those calls stay dynamic, named by their type string. Not part of
+	// any cache key (derived from the program like RemoteClients).
+	VarInits *VarInitIndex
 	// PbPaths is the generated-protobuf package heuristic (--pb-paths). The
 	// ZERO VALUE is the historical `pb,api` rule, so every existing
 	// zero-valued Opts keeps its emission. It gates remote-call recognition,
@@ -741,17 +747,26 @@ func (b *builder) handleCall(instr ssa.CallInstruction, kind pb.CallSite_Kind) {
 			callee.FQN = hash.FQN(sc)
 			arg0Recv = sc.Signature.Recv() != nil
 		} else {
-			// dynamic func value: resolve via the call graph if possible
-			callee.FQN = b.typeStr(cc.Value.Type())
-			targets, conf, capped := b.res.TargetsAt(instr)
-			callee.Targets = targets
-			cs.DispatchConfidence = conf
-			cs.Opaque = capped || len(targets) == 0
-			switch {
-			case capped:
-				b.nCapped++
-			case len(targets) == 0:
-				b.nUnresolved++
+			// dynamic func value. A package-level variable that its
+			// initializer binds exactly once to a static function IS that
+			// function (see VarInitIndex) — emit a static call. Everything
+			// else resolves via the call graph if possible.
+			if init := b.staticFuncVar(cc.Value); init != nil {
+				callee.Static = init
+				callee.FQN = hash.FQN(init)
+				arg0Recv = init.Signature.Recv() != nil
+			} else {
+				callee.FQN = b.typeStr(cc.Value.Type())
+				targets, conf, capped := b.res.TargetsAt(instr)
+				callee.Targets = targets
+				cs.DispatchConfidence = conf
+				cs.Opaque = capped || len(targets) == 0
+				switch {
+				case capped:
+					b.nCapped++
+				case len(targets) == 0:
+					b.nUnresolved++
+				}
 			}
 		}
 	}

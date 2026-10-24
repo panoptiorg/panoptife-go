@@ -106,6 +106,44 @@ hashed from its `callee_fqn`, which matches no emitted function. With
 kinds, and builtin calls, are counted as `unresolved` in the census line
 below.
 
+#### Package variables bound to one function
+
+Generated code often binds a helper at package scope and calls it through
+the variable:
+
+```go
+var marshalString = jsonpkg.String
+...
+marshalString(buf, v)
+```
+
+SSA sees a dynamic call: the callee operand is a load of a global, so the
+site is named by the variable's type string (`func(*bytes.Buffer, string)`),
+no catalog rule for `String` can select it, and calls through different
+variables of one type share one callee name. pc-fe proves the call static
+instead: it scans the program for uses of package-level variables. When a
+variable has exactly one store, that store sits in a package initializer
+(the synthetic one or a `func init()`), it stores a function, and every
+other use of the variable is a plain load — the address never escapes —
+then every call whose callee operand loads that variable is emitted as a
+static call to the function: `callee_fqn` is the function's fqn and the
+callee id is the function's iid. A variable with a second store — a rebind
+in any function, directly or through a pointer alias — with no initializer
+store, or whose address reaches another function (`f(&v)`, a field write on
+a global struct), stays dynamic. A single call-graph target does not
+qualify: the graph's answer depends on the flows it saw, not on the
+program, and a missed store would stamp the site with a wrong identity.
+
+A method expression bound this way (`var get = (*Store).Lookup`) stores the
+synthetic `$thunk` wrapper. The thunk's body is one static call to the
+method — its first parameter is the receiver — so the call site names the
+method (`(*pkg.Store).Lookup`, the name a catalog rule selects) and keeps
+the direct-call form: the receiver is arg 0, as in `recv.Lookup(...)`. A
+thunk whose body does not hold exactly one static call (a method promoted
+through an embedded interface) keeps the thunk wrapper's name. A bound
+method value (`var get = store.Lookup`) captures the receiver in a closure,
+so its wrapper keeps its own name and the call keeps one argument.
+
 ### Targets in dependency modules
 
 The SSA bodies of packages outside `--scope` are not built, and VTA learns a
