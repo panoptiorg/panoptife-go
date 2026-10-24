@@ -16,32 +16,39 @@ import (
 //     still emit the projection, or the opaque call's default leaf taints the
 //     clean field's read from the whole request.
 //
-// The negative controls keep their call sites when the pb package is out of
-// scope: HandRec (in the pb-path package but not generated protobuf output)
-// and FieldRec.GetH (result type ≠ same-named field's type). With the bodies
-// built, HandRec's trivial getter is covered by the SSA rule and GetH keeps
-// its barrier by the body check (it builds a literal).
+// A canonicalized getter keeps a ZERO-ARG shell call site: the projection
+// carries the field-precise flow (no arg ports, so no whole-object smear),
+// and the shell's callee fqn + result port stay as the hook the core's
+// catalog [[sources]] rules match — dropping the call site entirely made
+// every getter rule inert under field paths.
+//
+// The negative controls keep their FULL call sites (arg ports intact) when
+// the pb package is out of scope: HandRec (in the pb-path package but not
+// generated protobuf output) and FieldRec.GetH (result type ≠ same-named
+// field's type). With the bodies built, HandRec's trivial getter is covered
+// by the SSA rule and GetH keeps its barrier by the body check (it builds a
+// literal).
 func TestPbGetterCanonicalized(t *testing.T) {
 	for _, tc := range []struct {
 		scope     string
-		wantGone  string   // getter FQNs that must be projections
-		wantKept  []string // call sites that must keep their barrier
+		wantShell string   // getter FQNs that must be shell calls (argc 0)
+		wantKept  []string // call sites that must keep their full barrier
 		wantPaths []string
 	}{
 		{
 			// All bodies built: the SSA rule covers the trivial getters,
 			// including HandRec's (its body is trivial too).
 			scope:     "./...",
-			wantGone:  "/pb.Req).Get",
+			wantShell: "/pb.Req).Get",
 			wantKept:  []string{"/pb.FieldRec).GetH"},
 			wantPaths: []string{"A", "B", "Choice"},
 		},
 		{
 			// Only ./app built: the pb getters are bodiless — the go/types
 			// rule applies; the non-generated and type-mismatched getters
-			// stay opaque calls.
+			// stay real calls.
 			scope:     "./app",
-			wantGone:  "/pb.Req).Get",
+			wantShell: "/pb.Req).Get",
 			wantKept:  []string{"/pb.HandRec).GetA", "/pb.FieldRec).GetH"},
 			wantPaths: []string{"A", "B", "Choice"},
 		},
@@ -58,12 +65,22 @@ func TestPbGetterCanonicalized(t *testing.T) {
 			}
 			all := []*Result{handler("example.com/pbgetter/app.Handler"),
 				handler("example.com/pbgetter/app.Handler2")}
+			var shells, kept []string
 			for _, res := range all {
 				for _, cs := range res.Flow.Callsites {
-					if strings.Contains(cs.CalleeFqn, tc.wantGone) {
-						t.Errorf("getter call site %q leaked — must be a field projection", cs.CalleeFqn)
+					switch {
+					case strings.Contains(cs.CalleeFqn, tc.wantShell):
+						if cs.Argc != 0 {
+							t.Errorf("getter call site %q kept its %d arg ports — must be a zero-arg shell", cs.CalleeFqn, cs.Argc)
+						}
+						shells = append(shells, cs.CalleeFqn)
+					default:
+						kept = append(kept, cs.CalleeFqn)
 					}
 				}
+			}
+			if len(shells) == 0 {
+				t.Errorf("no shell call site for %q — the getter source hook is gone", tc.wantShell)
 			}
 			// path variants are asserted on Handler (all three getters read there)
 			for _, want := range tc.wantPaths {
@@ -72,12 +89,6 @@ func TestPbGetterCanonicalized(t *testing.T) {
 				}
 			}
 			// barrier keepers are asserted across both handlers
-			var kept []string
-			for _, res := range all {
-				for _, cs := range res.Flow.Callsites {
-					kept = append(kept, cs.CalleeFqn)
-				}
-			}
 			for _, want := range tc.wantKept {
 				found := false
 				for _, got := range kept {

@@ -213,9 +213,9 @@ func TestNCallInstrsWithCoverageSites(t *testing.T) {
 func checkNCallInstrs(t *testing.T, ld *loader.Loaded, pkg string, extra []Opts) (reads, calls int) {
 	t.Helper()
 	checked := 0
-	// W1F adds a SECOND canonicalized call (the `copy` builtin), so the invariant
-	// is now per-Opts and the enumeration must use the same filter emit hands to
-	// NewSnapshotResolver — not the bare IsCanonicalizedCall.
+	// The invariant is per-Opts and the enumeration must use the same filter
+	// emit hands to NewSnapshotResolver (the `copy` builtin is the only
+	// skipped call, and only under heap slots).
 	variants := []Opts{
 		{FieldPaths: true, ClosureFlow: true},
 		{FieldPaths: true, ClosureFlow: true, HeapSlots: true},

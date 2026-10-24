@@ -27,7 +27,10 @@ import (
 // snapshot's count means something different and must never be replayed.
 // v3: stored callee iids can name a function in a dependency module, which
 // has no emitted body, so a v2 reader would reject the snapshot.
-const SchemaVersion = 3
+// v4: canonicalized pb getters keep a zero-arg shell CallSite (and the
+// CanonicalizedCallFilter no longer skips them), so a v3 snapshot's call-site
+// ordinals and shapes do not match this build's emission.
+const SchemaVersion = 4
 
 // keepCommits bounds snapshots retained per namespace (GC keeps the newest N).
 const keepCommits = 8

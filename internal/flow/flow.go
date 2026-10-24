@@ -669,12 +669,20 @@ func (b *builder) handleCall(instr ssa.CallInstruction, kind pb.CallSite_Kind) {
 	cc := instr.Common()
 	resultVal := instr.Value()
 
-	// Getter canonicalization (doc 20 §2.2.1): a trivial pb getter is a field
-	// projection, not a barrier — keeping the CallSite would re-admit
-	// whole-object taint through the getter's default leaf.
+	// Getter canonicalization: a trivial pb getter is a field
+	// projection, not a barrier — arg ports would re-admit whole-object taint
+	// through the getter's default leaf. The CallSite itself stays as a
+	// zero-arg shell (getterShell): its result port is the hook the core's
+	// catalog [[sources]] rules match by callee fqn — the same hook the
+	// pre-canonicalization call site offered. Dropping the CallSite entirely
+	// made every getter rule inert under field paths: a projection's vertices
+	// cannot tell which getter — or whether one — was called, and sourcing a
+	// plain `x.F` read off its type's name would fire the rules on in-scope
+	// structs that merely share the name shape.
 	if b.opts.FieldPaths && resultVal != nil {
 		if fid, name, ok := trivialPbGetter(cc, b.opts.PbPaths); ok {
 			b.addProj(cc.Args[0], resultVal, fid, name)
+			b.getterShell(instr, kind, cc, resultVal)
 			return
 		}
 	}
@@ -921,6 +929,34 @@ func (b *builder) addFlow(from, to ssa.Value, alias bool) {
 
 func (b *builder) addProj(from, to ssa.Value, field uint32, name string) {
 	b.succ[from] = append(b.succ[from], edge{to: to, op: opProj, field: field, name: name})
+}
+
+// getterShell emits the CallSite a canonicalized pb getter keeps (see the
+// canonicalization branch in handleCall): callee identity and one result
+// port, deliberately no arg ports. The receiver is not an argument of the
+// projection, and a connected one would let the default leaf smear
+// whole-object taint through the getter again — the exact false route the
+// canonicalization removes. The result port is registered as the Call
+// value's alias like any other call, so a catalog source seeded on it flows
+// field-precisely through the projection edges.
+func (b *builder) getterShell(instr ssa.CallInstruction, kind pb.CallSite_Kind, cc *ssa.CallCommon, resultVal ssa.Value) {
+	csID := uint32(len(b.flow.Callsites))
+	sc := cc.StaticCallee() // trivialPbGetter guarantees a static callee
+	cs := &pb.CallSite{
+		Id:                 csID,
+		Kind:               kind,
+		DispatchConfidence: 1.0,
+		CalleeFqn:          hash.FQN(sc),
+		Span:               b.span(instr),
+	}
+	// one result — trivialPbGetter admits only single-result getters
+	v := b.addVertex(pb.VertexKind_CALL_RESULT_PORT, 0, csID, "", nil)
+	b.srcVerts[resultVal] = append(b.srcVerts[resultVal], v)
+	b.ordered = append(b.ordered, srcEntry{resultVal, v})
+	b.resultPort[[2]interface{}{resultVal, 0}] = v
+	cs.Resultc = 1
+	b.flow.Callsites = append(b.flow.Callsites, cs)
+	b.callees = append(b.callees, Callee{Kind: kind, Static: sc, FQN: cs.CalleeFqn})
 }
 
 func (b *builder) addInject(from, to ssa.Value, field uint32, name string) {
@@ -1730,31 +1766,19 @@ func isCopyBuiltin(cc *ssa.CallCommon) bool {
 	return ok && bi.Name() == "copy" && len(cc.Args) == 2
 }
 
-// IsCanonicalizedCall reports whether Build with field paths on emits NO
-// CallSite for instr (trivial pb getter → projection edge).
-func IsCanonicalizedCall(instr ssa.CallInstruction, pbp pkgclass.PbPaths) bool {
-	if instr.Value() == nil {
-		return false
-	}
-	_, _, ok := trivialPbGetter(instr.Common(), pbp)
-	return ok
-}
-
 // CanonicalizedCallFilter returns the predicate matching the CallInstructions
 // that Build under o emits NO CallSite for. The cgstore snapshot layer
 // re-enumerates CallInstructions to recover CallSite.Id ordinals, so it must
-// apply exactly this filter or every id shifts by the number of canonicalized
-// calls before it. nil means "nothing is canonicalized" — the pre-doc-20
-// behaviour, and the value emit passes when both features are off.
+// apply exactly this filter or every id shifts by the number of skipped calls
+// before it. A canonicalized pb getter KEEPS a (zero-arg shell) CallSite, so
+// only the `copy` builtin is skipped. nil means "nothing is skipped" — the
+// value emit passes when both features are off.
 func CanonicalizedCallFilter(o Opts) func(ssa.CallInstruction) bool {
-	if !o.FieldPaths && !o.HeapSlots {
+	if !o.HeapSlots {
 		return nil
 	}
 	return func(instr ssa.CallInstruction) bool {
-		if o.FieldPaths && IsCanonicalizedCall(instr, o.PbPaths) {
-			return true
-		}
-		return o.HeapSlots && isCopyBuiltin(instr.Common())
+		return isCopyBuiltin(instr.Common())
 	}
 }
 
